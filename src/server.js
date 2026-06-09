@@ -1,6 +1,6 @@
 import http from "node:http";
 import { ZaiClient } from "./client.js";
-import { loadSession, clearSession } from "./config.js";
+import { loadSession, clearSession } from "./auth.js";
 import { login } from "./auth.js";
 
 const PORT = process.env.ZAI_PORT || 3210;
@@ -9,7 +9,6 @@ export async function startServer() {
   const client = new ZaiClient();
   
   const server = http.createServer(async (req, res) => {
-    // CORS headers
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -23,7 +22,6 @@ export async function startServer() {
     const url = new URL(req.url, `http://localhost:${PORT}`);
     
     try {
-      // GET /status - Check login status
       if (req.method === "GET" && url.pathname === "/status") {
         const status = await client.status();
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -31,12 +29,9 @@ export async function startServer() {
         return;
       }
 
-      // POST /login - Start login flow (launches browser)
       if (req.method === "POST" && url.pathname === "/login") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ message: "Login started. Please complete login in the browser window." }));
-        
-        // Start login in background
         login({ headless: false })
           .then((session) => {
             client.session = session;
@@ -49,7 +44,6 @@ export async function startServer() {
         return;
       }
 
-      // POST /logout - Clear session
       if (req.method === "POST" && url.pathname === "/logout") {
         clearSession();
         client.session = null;
@@ -59,51 +53,46 @@ export async function startServer() {
         return;
       }
 
-      // POST /chat - Send chat message
       if (req.method === "POST" && url.pathname === "/chat") {
         const body = await readBody(req);
-        const params = JSON.parse(body);
-        
+        let params;
+        try {
+          params = JSON.parse(body);
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON body" }));
+          return;
+        }
         if (!params.message) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "message is required" }));
           return;
         }
-
         if (!client.isLoggedIn) {
-          res.writeHead(401, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Not logged in. POST /login first" }));
-          return;
-        }
-
-        // Reload session if client doesn't have it but file exists
-        if (!client.session) {
           client.session = loadSession();
+          if (!client.isLoggedIn) {
+            res.writeHead(401, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Not logged in. POST /login first" }));
+            return;
+          }
         }
 
-        const stream = params.stream !== false;
-
-        if (stream) {
+        const useStream = params.stream !== false;
+        if (useStream) {
           res.writeHead(200, {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
             Connection: "keep-alive",
           });
-
           const result = await client.chat({
             message: params.message,
             model: params.model || "glm-4-plus",
             conversationId: params.conversation_id,
             stream: true,
             onChunk: (chunk) => {
-              const sseData = JSON.stringify({
-                delta: chunk.delta,
-                conversation_id: chunk.conversationId,
-              });
-              res.write(`data: ${sseData}\n\n`);
+              res.write(`data: ${JSON.stringify({ delta: chunk.delta, conversation_id: chunk.conversationId })}\n\n`);
             },
           });
-
           res.write(`data: ${JSON.stringify({ done: true, content: result.content, conversation_id: result.conversationId })}\n\n`);
           res.end();
         } else {
@@ -119,7 +108,6 @@ export async function startServer() {
         return;
       }
 
-      // GET / - API info
       if (req.method === "GET" && url.pathname === "/") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
@@ -147,12 +135,6 @@ export async function startServer() {
 
   server.listen(PORT, () => {
     console.log(`[ZAI] Server running at http://localhost:${PORT}`);
-    console.log(`[ZAI] Endpoints:`);
-    console.log(`  GET  /        - API info`);
-    console.log(`  GET  /status  - Check login status`);
-    console.log(`  POST /login   - Start browser login`);
-    console.log(`  POST /logout  - Clear session`);
-    console.log(`  POST /chat    - Send chat message`);
   });
 }
 
@@ -165,5 +147,4 @@ function readBody(req) {
   });
 }
 
-// Run if called directly
 startServer().catch(console.error);
