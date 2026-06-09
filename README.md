@@ -1,38 +1,34 @@
-# Z.AI API Wrapper
+# Z.AI Zero-Token
 
-Standalone Z.AI API wrapper - login once, call forever via API.
+Use chat.z.ai without an API key — login via browser, call API forever.
 
-Wraps the Z.AI global endpoint (`https://api.z.ai/api/paas/v4`) with an easy-to-use CLI, HTTP server, and TypeScript SDK.
+## How It Works
 
-## Features
-
-- **Login once** - API key persisted locally, auto-reused
-- **CLI** - Chat from the terminal
-- **HTTP Server** - OpenAI-compatible API for integration
-- **Streaming** - SSE streaming support
-- **Multiple Models** - GLM-5, GLM-4.7, GLM-4.5 series
-- **Tool Calling** - Agent loop with tool use
-- **TypeScript SDK** - Programmatic access
+1. `zai login` opens a real browser to chat.z.ai
+2. You login manually (Google, GitHub, email, etc.)
+3. Browser cookies are captured and saved to `~/.zai/auth.json`
+4. `zai chat` uses those cookies to call the chat.z.ai API directly
+5. **No API key needed — zero token!**
 
 ## Quick Start
 
 ```bash
-# Install dependencies
+# Install
 npm install
 
 # Build
 npm run build
 
-# Login (saves API key to ~/.zai/config.json)
-node dist/cli.js login --api-key YOUR_API_KEY
+# Login (opens browser to chat.z.ai)
+node dist/cli.js login
 
-# Chat
-node dist/cli.js chat "Hello, who are you?"
+# Chat!
+node dist/cli.js chat "你好，你是谁？"
 
 # Streaming chat
-node dist/cli.js chat --stream "Explain quantum computing"
+node dist/cli.js chat --stream "解释量子计算"
 
-# Start API server
+# Start HTTP API server
 node dist/cli.js serve --port 3456
 ```
 
@@ -40,160 +36,107 @@ node dist/cli.js serve --port 3456
 
 | Command | Description |
 |---------|-------------|
-| `zai login [--api-key KEY]` | Save API key |
-| `zai logout` | Remove saved API key |
+| `zai login` | Open browser, login to chat.z.ai |
+| `zai login --cdp-url URL` | Connect to running Chrome |
 | `zai status` | Check login status |
 | `zai chat "message"` | Send a chat message |
 | `zai chat --stream "msg"` | Stream response |
-| `zai chat --model glm-5 "msg"` | Use specific model |
+| `zai chat --model glm-4-plus "msg"` | Use specific model |
 | `zai models` | List available models |
 | `zai serve [--port 3456]` | Start HTTP server |
-| `zai help` | Show help |
+| `zai logout` | Clear saved auth |
 
 ## HTTP Server Endpoints
 
-Start the server with `zai serve`, then use these endpoints:
-
-### POST /login
-
-Save your API key.
-
-```bash
-curl -X POST http://localhost:3456/login \
-  -H "Content-Type: application/json" \
-  -d '{"api_key": "your_api_key_here"}'
-```
+Start with `zai serve`, then:
 
 ### POST /chat
-
-Simple chat, returns full response.
 
 ```bash
 curl -X POST http://localhost:3456/chat \
   -H "Content-Type: application/json" \
-  -d '{"message": "Hello!", "model": "glm-4.7-flash"}'
+  -d '{"message": "Hello!"}'
 ```
 
 ### POST /chat/stream
 
-Streaming chat (SSE).
-
 ```bash
 curl -N http://localhost:3456/chat/stream \
   -H "Content-Type: application/json" \
-  -d '{"message": "Tell me a story", "stream": true}'
+  -d '{"message": "Tell me a story"}'
 ```
-
-### POST /completions
-
-OpenAI-compatible chat completions.
-
-```bash
-curl -X POST http://localhost:3456/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "glm-4.7-flash",
-    "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
-      {"role": "user", "content": "Hello!"}
-    ]
-  }'
-```
-
-Streaming:
-
-```bash
-curl -N http://localhost:3456/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "glm-4.7-flash",
-    "stream": true,
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-```
-
-### GET /models
-
-List available models.
 
 ### GET /status
 
-Check login status.
+Check login status and cookie health.
+
+### GET /models
+
+List available model IDs and their assistant IDs.
 
 ### POST /logout
 
-Remove saved API key.
+Clear saved authentication.
 
 ## TypeScript SDK
 
 ```typescript
-import { ZaiClient } from "zai";
+import { loginViaBrowser, ZaiZeroTokenClient } from "zai";
 
-// After `zai login`, the client auto-loads the saved key
-const client = new ZaiClient();
+// Login (first time only)
+await loginViaBrowser();
+
+// After login, cookies are persisted — just create a client
+const client = new ZaiZeroTokenClient();
 
 // Simple chat
-const text = await client.chat("Hello, who are you?");
+const result = await client.chat("Hello, who are you?");
+console.log(result.text);
 
 // Streaming chat
-await client.chatStream("Tell me a joke", (chunk) => {
-  process.stdout.write(chunk);
-});
-
-// Full completions API
-const response = await client.chatCompletion({
-  model: "glm-4.7-flash",
-  messages: [
-    { role: "system", content: "You are a helpful assistant." },
-    { role: "user", content: "Explain AI in one sentence." },
-  ],
-  temperature: 0.7,
-});
-
-// Tool calling (agent loop)
-const conversation = await client.agentLoop({
-  messages: [{ role: "user", content: "What is the weather in Tokyo?" }],
-  tools: [{
-    type: "function",
-    function: {
-      name: "get_weather",
-      description: "Get weather for a city",
-      parameters: {
-        type: "object",
-        properties: { city: { type: "string" } },
-        required: ["city"],
-      },
-    },
-  }],
-  onToolCall: async (name, args) => {
-    if (name === "get_weather") {
-      return JSON.stringify({ city: "Tokyo", temp: "18C", condition: "sunny" });
-    }
-    return "unknown tool";
-  },
+await client.chatStream("Tell me a joke", {
+  onText: (delta) => process.stdout.write(delta),
+  onThinking: (delta) => console.log("[thinking]", delta),
+  onDone: (fullText) => console.log("\nDone!"),
 });
 ```
 
+## Technical Details
+
+### Authentication Flow
+
+The project extracts the same authentication flow that chat.z.ai uses internally:
+
+1. **Browser Login**: Playwright opens Chrome, you login manually
+2. **Cookie Capture**: `chatglm_refresh_token` and `chatglm_token` are captured
+3. **Token Refresh**: Uses the refresh token to get new access tokens via `/chatglm/user-api/user/refresh`
+4. **API Calls**: Calls `/chatglm/backend-api/assistant/stream` with the access token and signed headers
+
+### Request Signing
+
+Every API request requires these headers (extracted from chat.z.ai frontend JS):
+
+- `X-Sign`: MD5 hash of `{timestamp}-{nonce}-{secret}`
+- `X-Nonce`: Random UUID
+- `X-Timestamp`: Modified timestamp
+- `X-Device-Id`: Random device UUID
+- `X-Exp-Groups`: Feature flag groups
+
+### Stream Parsing
+
+The API returns SSE events with GLM's custom format:
+- Text content in `parts[].content[].text` (accumulated, not delta)
+- Thinking content wrapped in `<think>...</think>` tags
+- Tool calls wrapped in `<tool_call>...</tool_call>` tags
+
 ## Available Models
 
-| Model ID | Name | Context Window | Max Tokens |
-|----------|------|---------------|------------|
-| glm-5 | GLM-5 | 202,800 | 131,100 |
-| glm-5-turbo | GLM-5 Turbo | 202,800 | 131,100 |
-| glm-4.7 | GLM-4.7 | 204,800 | 131,072 |
-| glm-4.7-flash | GLM-4.7 Flash | 200,000 | 131,072 |
-| glm-4.7-flashx | GLM-4.7 FlashX | 200,000 | 128,000 |
-| glm-4.5 | GLM-4.5 | 131,072 | 98,304 |
-| glm-4.5-flash | GLM-4.5 Flash | 131,072 | 98,304 |
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| ZAI_API_KEY | - | API key (alternative to `zai login`) |
-| ZAI_BASE_URL | https://api.z.ai/api/paas/v4 | API base URL |
-| ZAI_DEFAULT_MODEL | glm-4.7-flash | Default model |
-| ZAI_PORT | 3456 | Server port |
+| Model ID | Assistant ID |
+|----------|-------------|
+| glm-4-plus | 65940acff94777010aa6b796 |
+| glm-4 | 65940acff94777010aa6b796 |
+| glm-4-think | 676411c38945bbc58a905d31 |
+| glm-4-zero | 676411c38945bbc58a905d31 |
 
 ## License
 

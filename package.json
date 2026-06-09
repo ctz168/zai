@@ -1,7 +1,7 @@
 {
   "name": "zai",
-  "version": "1.0.0",
-  "description": "Standalone Z.AI API wrapper - login once, call forever via API",
+  "version": "2.0.0",
+  "description": "Z.AI Zero-Token - login via browser, call API forever without API key",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -13,10 +13,10 @@
     "dev": "tsc && node dist/server.js",
     "cli": "tsc && node dist/cli.js"
   },
-  "keywords": ["zai", "z.ai", "glm", "api", "chatbot"],
+  "keywords": ["zai", "z.ai", "glm", "zero-token", "chatglm"],
   "license": "MIT",
   "dependencies": {
-    "dotenv": "^16.4.7"
+    "playwright-core": "^1.52.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

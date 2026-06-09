@@ -1,21 +1,21 @@
 /**
- * Z.AI HTTP Server
+ * Z.AI Zero-Token HTTP Server
  *
- * Provides a local HTTP API server that wraps the Z.AI global endpoint.
- * After logging in once (POST /login), all subsequent requests use the
- * persisted API key automatically.
+ * Local HTTP API that wraps chat.z.ai via browser-captured cookies.
+ * After logging in once (`zai login`), all requests use the persisted
+ * cookie state — no API key needed.
  *
  * Endpoints:
- *   POST /login          - Save API key
  *   GET  /status         - Check login status
- *   POST /chat           - Simple chat (returns full text)
+ *   POST /chat           - Simple chat
  *   POST /chat/stream    - Streaming chat (SSE)
- *   POST /completions    - OpenAI-compatible chat completions
  *   GET  /models         - List available models
+ *   POST /logout         - Clear saved auth
  */
 
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
-import { ZaiClient, ZAI_GLOBAL_BASE_URL, MODELS, isloggedIn, type ZaiModelId, type ChatMessage, type ZaiTool } from "./client.js";
+import { isLoggedIn, loadAuth, clearAuth, ASSISTANT_ID_MAP } from "./auth.js";
+import { ZaiZeroTokenClient } from "./client.js";
 
 // ─── Helpers ──────────────────────────────────────────────────
 
@@ -29,7 +29,7 @@ function readBody(req: IncomingMessage): Promise<string> {
 }
 
 function sendJson(res: ServerResponse, status: number, data: unknown) {
-  res.writeHead(status, { "Content-Type": "application/json" });
+  res.writeHead(status, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
   res.end(JSON.stringify(data));
 }
 
@@ -37,22 +37,11 @@ function sendError(res: ServerResponse, status: number, message: string) {
   sendJson(res, status, { error: { message, status } });
 }
 
-function getCorsHeaders(): Record<string, string> {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-  };
-}
-
 // ─── Server ───────────────────────────────────────────────────
 
 export interface ServerOptions {
   port?: number;
   host?: string;
-  apiKey?: string;
-  baseUrl?: string;
-  defaultModel?: ZaiModelId;
 }
 
 export function startServer(options: ServerOptions = {}) {
@@ -60,11 +49,13 @@ export function startServer(options: ServerOptions = {}) {
   const host = options.host ?? "127.0.0.1";
 
   const server = createServer(async (req, res) => {
-    const corsHeaders = getCorsHeaders();
-
     // CORS preflight
     if (req.method === "OPTIONS") {
-      res.writeHead(204, corsHeaders);
+      res.writeHead(204, {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      });
       res.end();
       return;
     }
@@ -73,72 +64,47 @@ export function startServer(options: ServerOptions = {}) {
     const path = url.pathname;
 
     try {
-      // ──── POST /login ──────────────────────────────
-      if (path === "/login" && req.method === "POST") {
-        const body = JSON.parse(await readBody(req));
-        const apiKey = body.api_key ?? body.apiKey ?? body.token;
-        const baseUrl = body.base_url ?? body.baseUrl ?? ZAI_GLOBAL_BASE_URL;
-
-        if (!apiKey) {
-          sendError(res, 400, "Missing api_key in request body");
-          return;
-        }
-
-        try {
-          await ZaiClient.login(apiKey, baseUrl);
-          sendJson(res, 200, {
-            ok: true,
-            message: "Login successful. API key saved.",
-            base_url: baseUrl,
-          });
-        } catch (err) {
-          sendError(
-            res,
-            401,
-            `Login failed: ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
-        return;
-      }
-
       // ──── GET /status ──────────────────────────────
       if (path === "/status" && req.method === "GET") {
+        const auth = loadAuth();
         sendJson(res, 200, {
-          logged_in: isloggedIn(),
-          base_url: ZAI_GLOBAL_BASE_URL,
-          default_model: options.defaultModel ?? "glm-4.7-flash",
+          logged_in: isLoggedIn(),
+          has_refresh_token: auth?.refreshToken ? true : false,
+          has_access_token: auth?.accessToken ? true : false,
+          captured_at: auth?.capturedAt,
+          cookie_length: auth?.cookie?.length ?? 0,
         });
         return;
       }
 
       // ──── POST /logout ─────────────────────────────
       if (path === "/logout" && req.method === "POST") {
-        ZaiClient.logout();
+        clearAuth();
         sendJson(res, 200, { ok: true, message: "Logged out" });
         return;
       }
 
       // ──── GET /models ──────────────────────────────
       if (path === "/models" && req.method === "GET") {
-        const modelList = Object.entries(MODELS).map(([id, info]) => ({
-          id,
-          ...info,
-        }));
         sendJson(res, 200, {
           object: "list",
-          data: modelList,
+          data: Object.entries(ASSISTANT_ID_MAP).map(([id, assistantId]) => ({
+            id,
+            assistant_id: assistantId,
+          })),
         });
         return;
       }
 
       // ──── POST /chat ───────────────────────────────
       if (path === "/chat" && req.method === "POST") {
+        if (!isLoggedIn()) {
+          sendError(res, 401, "Not logged in. Run `zai login` first.");
+          return;
+        }
+
         const body = JSON.parse(await readBody(req));
-        const client = new ZaiClient({
-          apiKey: options.apiKey,
-          baseUrl: options.baseUrl,
-          defaultModel: options.defaultModel,
-        });
+        const client = new ZaiZeroTokenClient();
 
         const message = body.message ?? body.prompt;
         if (!message) {
@@ -146,31 +112,30 @@ export function startServer(options: ServerOptions = {}) {
           return;
         }
 
-        const text = await client.chat(message, {
-          system: body.system ?? body.system_prompt,
-          model: body.model as ZaiModelId | undefined,
-          temperature: body.temperature,
-          history: body.history as ChatMessage[] | undefined,
+        const result = await client.chat(message, {
+          model: body.model,
+          conversationId: body.conversation_id,
+          systemPrompt: body.system ?? body.system_prompt,
+          history: body.history,
         });
 
-        res.writeHead(200, { "Content-Type": "application/json", ...corsHeaders });
-        res.end(
-          JSON.stringify({
-            message: { role: "assistant", content: text },
-            model: body.model ?? options.defaultModel ?? "glm-4.7-flash",
-          })
-        );
+        sendJson(res, 200, {
+          message: { role: "assistant", content: result.text },
+          conversation_id: result.conversationId,
+          thinking: result.thinking,
+        });
         return;
       }
 
       // ──── POST /chat/stream ────────────────────────
       if (path === "/chat/stream" && req.method === "POST") {
+        if (!isLoggedIn()) {
+          sendError(res, 401, "Not logged in. Run `zai login` first.");
+          return;
+        }
+
         const body = JSON.parse(await readBody(req));
-        const client = new ZaiClient({
-          apiKey: options.apiKey,
-          baseUrl: options.baseUrl,
-          defaultModel: options.defaultModel,
-        });
+        const client = new ZaiZeroTokenClient();
 
         const message = body.message ?? body.prompt;
         if (!message) {
@@ -182,7 +147,7 @@ export function startServer(options: ServerOptions = {}) {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
           Connection: "keep-alive",
-          ...corsHeaders,
+          "Access-Control-Allow-Origin": "*",
         });
 
         const sendSSE = (event: string, data: unknown) => {
@@ -190,19 +155,29 @@ export function startServer(options: ServerOptions = {}) {
         };
 
         try {
-          const fullText = await client.chatStream(
+          const result = await client.chatStream(
             message,
-            (chunk) => {
-              sendSSE("delta", { content: chunk });
+            {
+              onText: (delta) => sendSSE("delta", { content: delta }),
+              onThinking: (delta) => sendSSE("thinking", { content: delta }),
+              onDone: (fullText) => sendSSE("done", {
+                content: fullText,
+                conversation_id: result.conversationId,
+              }),
             },
             {
-              system: body.system ?? body.system_prompt,
-              model: body.model as ZaiModelId | undefined,
-              temperature: body.temperature,
-              history: body.history as ChatMessage[] | undefined,
+              model: body.model,
+              conversationId: body.conversation_id,
+              systemPrompt: body.system ?? body.system_prompt,
+              history: body.history,
             }
           );
-          sendSSE("done", { content: fullText });
+
+          sendSSE("done", {
+            content: result.text,
+            conversation_id: result.conversationId,
+            thinking: result.thinking,
+          });
         } catch (err) {
           sendSSE("error", {
             message: err instanceof Error ? err.message : String(err),
@@ -213,73 +188,22 @@ export function startServer(options: ServerOptions = {}) {
         return;
       }
 
-      // ──── POST /completions (OpenAI-compatible) ────
-      if (path === "/completions" && req.method === "POST") {
-        const body = JSON.parse(await readBody(req));
-        const client = new ZaiClient({
-          apiKey: options.apiKey,
-          baseUrl: options.baseUrl,
-          defaultModel: options.defaultModel,
-        });
-
-        const isStream = body.stream === true;
-
-        if (isStream) {
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-            ...corsHeaders,
-          });
-
-          for await (const chunk of client.chatCompletionStream({
-            model: body.model as ZaiModelId | undefined,
-            messages: body.messages as ChatMessage[],
-            temperature: body.temperature,
-            topP: body.top_p,
-            maxTokens: body.max_tokens,
-            tools: body.tools as ZaiTool[] | undefined,
-          })) {
-            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-          }
-          res.write("data: [DONE]\n\n");
-          res.end();
-        } else {
-          const result = await client.chatCompletion({
-            model: body.model as ZaiModelId | undefined,
-            messages: body.messages as ChatMessage[],
-            temperature: body.temperature,
-            topP: body.top_p,
-            maxTokens: body.max_tokens,
-            tools: body.tools as ZaiTool[] | undefined,
-          });
-          sendJson(res, 200, result);
-        }
-        return;
-      }
-
       // ──── 404 ──────────────────────────────────────
       sendError(res, 404, `Not found: ${path}`);
     } catch (err) {
       console.error("Request error:", err);
-      sendError(
-        res,
-        500,
-        err instanceof Error ? err.message : "Internal server error"
-      );
+      sendError(res, 500, err instanceof Error ? err.message : "Internal server error");
     }
   });
 
   server.listen(port, host, () => {
-    console.log(`\n  🟢 Z.AI API Server running at http://${host}:${port}`);
+    console.log(`\n  🟢 Z.AI Zero-Token Server running at http://${host}:${port}`);
     console.log(`\n  Endpoints:`);
-    console.log(`    POST /login          - Save your API key`);
     console.log(`    GET  /status         - Check login status`);
     console.log(`    POST /chat           - Simple chat`);
     console.log(`    POST /chat/stream    - Streaming chat (SSE)`);
-    console.log(`    POST /completions    - OpenAI-compatible API`);
-    console.log(`    GET  /models         - List available models`);
-    console.log(`    POST /logout         - Remove saved API key`);
+    console.log(`    GET  /models         - List models`);
+    console.log(`    POST /logout         - Clear saved auth`);
     console.log();
   });
 

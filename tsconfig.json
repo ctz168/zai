@@ -9,6 +9,7 @@
     "esModuleInterop": true,
     "declaration": true,
     "sourceMap": true,
+    "lib": ["ES2023", "DOM"],
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true

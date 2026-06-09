@@ -1,19 +1,23 @@
 #!/usr/bin/env node
 /**
- * Z.AI CLI - Command-line interface for Z.AI API
+ * Z.AI Zero-Token CLI
+ *
+ * Login via browser (zero token), then chat freely.
  *
  * Usage:
- *   zai login [--api-key KEY] [--base-url URL]
- *   zai logout
- *   zai status
- *   zai chat "Hello, who are you?"
- *   zai chat --stream "Tell me a joke"
- *   zai models
- *   zai serve [--port 3456]
+ *   zai login                    # Open browser, login to chat.z.ai
+ *   zai login --cdp-url URL      # Connect to running Chrome
+ *   zai status                   # Check login status
+ *   zai chat "Hello!"            # Chat
+ *   zai chat --stream "Hello!"   # Streaming chat
+ *   zai serve [--port 3456]      # Start HTTP API server
+ *   zai logout                   # Clear saved auth
+ *   zai help                     # Show help
  */
 
 import { createInterface } from "node:readline";
-import { ZaiClient, ZAI_GLOBAL_BASE_URL, ZAI_CN_BASE_URL, MODELS, isloggedIn, loadConfig, type ZaiModelId } from "./client.js";
+import { loginViaBrowser, isLoggedIn, loadAuth, clearAuth, ASSISTANT_ID_MAP } from "./auth.js";
+import { ZaiZeroTokenClient } from "./client.js";
 import { startServer } from "./server.js";
 
 // ─── Parse Args ───────────────────────────────────────────────
@@ -50,66 +54,45 @@ function parseArgs(argv: string[]): {
 // ─── Commands ─────────────────────────────────────────────────
 
 async function cmdLogin(flags: Record<string, string>) {
-  let apiKey = flags["api-key"] ?? flags["apikey"] ?? process.env.ZAI_API_KEY;
-
-  if (!apiKey) {
-    apiKey = await prompt("Enter your Z.AI API key: ");
-  }
-
-  if (!apiKey) {
-    console.error("Error: API key is required.");
-    process.exit(1);
-  }
-
-  const baseUrl = flags["base-url"] ?? flags["baseUrl"] ?? ZAI_GLOBAL_BASE_URL;
-
-  console.log(`Logging in to ${baseUrl}...`);
+  const cdpUrl = flags["cdp-url"] ?? flags["cdpUrl"];
+  const headless = flags["headless"] === "true";
 
   try {
-    await ZaiClient.login(apiKey, baseUrl);
-    console.log("✅ Login successful! API key saved.");
-    console.log(`   Config saved to ~/.zai/config.json`);
-    console.log(`   Base URL: ${baseUrl}`);
-    console.log(`   Default model: glm-4.7-flash`);
+    await loginViaBrowser({
+      headless,
+      cdpUrl,
+    });
+    console.log("\n✅ You can now use `zai chat` to chat without an API key!");
   } catch (err) {
     console.error(
-      `❌ Login failed: ${err instanceof Error ? err.message : String(err)}`
+      `\n❌ Login failed: ${err instanceof Error ? err.message : String(err)}`
     );
     process.exit(1);
   }
 }
 
 async function cmdLogout() {
-  ZaiClient.logout();
-  console.log("✅ Logged out. API key removed.");
+  clearAuth();
+  console.log("✅ Logged out. Auth state cleared.");
 }
 
 async function cmdStatus() {
-  const loggedIn = isloggedIn();
-  const config = loadConfig();
+  const loggedIn = isLoggedIn();
+  const auth = loadAuth();
 
-  console.log(`Logged in: ${loggedIn ? "✅ Yes" : "❌ No"}`);
-  if (config) {
-    console.log(`Base URL:   ${config.baseUrl}`);
-    console.log(`Model:      ${config.defaultModel}`);
-    console.log(`API Key:    ${config.apiKey.slice(0, 8)}...${config.apiKey.slice(-4)}`);
+  console.log(`Logged in:       ${loggedIn ? "✅ Yes" : "❌ No"}`);
+  if (auth) {
+    const age = Date.now() - auth.capturedAt;
+    const hours = Math.floor(age / 3600000);
+    const minutes = Math.floor((age % 3600000) / 60000);
+    console.log(`Captured:        ${hours}h ${minutes}m ago`);
+    console.log(`Refresh token:   ${auth.refreshToken ? "✓" : "✗"}`);
+    console.log(`Access token:    ${auth.accessToken ? "✓" : "✗"}`);
+    console.log(`Cookie length:   ${auth.cookie.length}`);
   }
   if (!loggedIn) {
-    console.log("\nRun `zai login` to authenticate.");
+    console.log("\nRun `zai login` to authenticate via browser.");
   }
-}
-
-async function cmdModels() {
-  console.log("\nAvailable Z.AI Models:\n");
-  console.log("  Model ID          Name                  Context    Max Tokens");
-  console.log("  ───────────────── ───────────────────── ────────── ──────────");
-
-  for (const [id, info] of Object.entries(MODELS)) {
-    console.log(
-      `  ${id.padEnd(18)} ${(info.name).padEnd(21)} ${String(info.contextWindow).padEnd(10)} ${info.maxTokens}`
-    );
-  }
-  console.log();
 }
 
 async function cmdChat(positional: string[], flags: Record<string, string>) {
@@ -119,91 +102,103 @@ async function cmdChat(positional: string[], flags: Record<string, string>) {
     process.exit(1);
   }
 
-  const client = new ZaiClient();
-  const model = (flags["model"] ?? flags["m"]) as ZaiModelId | undefined;
+  if (!isLoggedIn()) {
+    console.error("Error: Not logged in. Run `zai login` first.");
+    process.exit(1);
+  }
+
+  const client = new ZaiZeroTokenClient();
+  const model = flags["model"] ?? flags["m"];
   const stream = flags["stream"] === "true" || flags["s"] === "true";
-  const system = flags["system"] ?? flags["sys"];
 
   if (stream) {
     process.stdout.write("\n");
-    await client.chatStream(
+    const result = await client.chatStream(
       message,
-      (chunk) => {
-        process.stdout.write(chunk);
+      {
+        onText: (delta) => process.stdout.write(delta),
+        onThinking: (delta) => process.stderr.write(`[think] ${delta}`),
       },
-      { model, system }
+      { model }
     );
     process.stdout.write("\n\n");
+    if (result.conversationId) {
+      console.log(`(conversation: ${result.conversationId})`);
+    }
   } else {
-    const text = await client.chat(message, { model, system });
-    console.log(`\n${text}\n`);
+    const result = await client.chat(message, { model });
+    console.log(`\n${result.text}\n`);
+    if (result.thinking) {
+      console.log(`[thinking]: ${result.thinking.substring(0, 200)}...`);
+    }
   }
+}
+
+async function cmdModels() {
+  console.log("\nAvailable Models (via chat.z.ai web API):\n");
+  console.log("  Model ID          Assistant ID");
+  console.log("  ───────────────── ──────────────────────────────");
+  for (const [id, assistantId] of Object.entries(ASSISTANT_ID_MAP)) {
+    console.log(`  ${id.padEnd(18)} ${assistantId}`);
+  }
+  console.log();
 }
 
 async function cmdServe(flags: Record<string, string>) {
   const port = parseInt(flags["port"] ?? flags["p"] ?? "3456", 10);
   const host = flags["host"] ?? flags["h"] ?? "127.0.0.1";
-
   startServer({ port, host });
 }
 
 async function cmdHelp() {
   console.log(`
-Z.AI CLI - Standalone Z.AI API wrapper
+Z.AI Zero-Token CLI - Use chat.z.ai without an API key
 
 Usage:
   zai <command> [options]
 
 Commands:
-  login     Save your Z.AI API key
-  logout    Remove saved API key
+  login     Login via browser (opens chat.z.ai)
+  logout    Clear saved authentication
   status    Check login status
   chat      Send a chat message
   models    List available models
   serve     Start HTTP API server
   help      Show this help
 
-Options:
-  --api-key KEY     API key for login
-  --base-url URL    API base URL (default: https://api.z.ai/api/paas/v4)
-  --model MODEL     Model to use (default: glm-4.7-flash)
-  --stream          Stream response (for chat)
-  --system PROMPT   System prompt (for chat)
-  --port PORT       Server port (for serve, default: 3456)
+Login Options:
+  --cdp-url URL     Connect to running Chrome via CDP
+  --headless        Run browser in headless mode (not recommended for login)
+
+Chat Options:
+  --model MODEL     Model to use (default: glm-4)
+  --stream          Stream response in real-time
+
+Server Options:
+  --port PORT       Server port (default: 3456)
+  --host HOST       Server host (default: 127.0.0.1)
 
 Examples:
-  zai login --api-key your_api_key_here
+  zai login                          # Opens browser, login to chat.z.ai
+  zai login --cdp-url http://localhost:9222  # Use existing Chrome
   zai chat "Hello, who are you?"
-  zai chat --stream --model glm-5 "Explain quantum computing"
+  zai chat --stream --model glm-4-plus "Explain AI"
   zai serve --port 8080
 
-Environment Variables:
-  ZAI_API_KEY       API key (alternative to login)
+How It Works:
+  1. 'zai login' opens a real browser to chat.z.ai
+  2. You login manually (Google, GitHub, email, etc.)
+  3. Cookies are captured and saved to ~/.zai/auth.json
+  4. 'zai chat' uses those cookies to call the API directly
+  5. No API key needed — zero token!
 
 API Server Endpoints (when using 'zai serve'):
-  POST /login          Save API key
+  GET  /status         Check login status
   POST /chat           Simple chat { "message": "..." }
   POST /chat/stream    Streaming chat (SSE)
-  POST /completions    OpenAI-compatible API
   GET  /models         List available models
-  GET  /status         Check login status
+  POST /logout         Clear saved auth
 `);
-}
-
-// ─── Prompt Helper ────────────────────────────────────────────
-
-function prompt(question: string): Promise<string> {
-  const rl = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-
-  return new Promise((resolve) => {
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer.trim());
-    });
-  });
 }
 
 // ─── Main ─────────────────────────────────────────────────────

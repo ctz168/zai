@@ -1,500 +1,408 @@
 /**
- * Z.AI API Client
+ * Z.AI Zero-Token Client
  *
- * Wraps the Z.AI global endpoint (https://api.z.ai/api/paas/v4)
- * with OpenAI-compatible chat completions interface.
- *
- * Supports:
- *   - API Key authentication (login once, reuse)
- *   - Chat completions (sync & streaming)
- *   - Multiple GLM models
- *   - Automatic token persistence
+ * Uses browser-captured cookies to call the chat.z.ai API directly,
+ * without needing an API key. Supports streaming, token refresh,
+ * and conversation management.
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
-
-// ─── Constants ────────────────────────────────────────────────
-
-export const ZAI_GLOBAL_BASE_URL = "https://api.z.ai/api/paas/v4";
-export const ZAI_CN_BASE_URL = "https://open.bigmodel.cn/api/paas/v4";
-
-export const MODELS = {
-  "glm-5": {
-    name: "GLM-5",
-    reasoning: true,
-    contextWindow: 202800,
-    maxTokens: 131100,
-  },
-  "glm-5-turbo": {
-    name: "GLM-5 Turbo",
-    reasoning: true,
-    contextWindow: 202800,
-    maxTokens: 131100,
-  },
-  "glm-4.7": {
-    name: "GLM-4.7",
-    reasoning: true,
-    contextWindow: 204800,
-    maxTokens: 131072,
-  },
-  "glm-4.7-flash": {
-    name: "GLM-4.7 Flash",
-    reasoning: true,
-    contextWindow: 200000,
-    maxTokens: 131072,
-  },
-  "glm-4.7-flashx": {
-    name: "GLM-4.7 FlashX",
-    reasoning: true,
-    contextWindow: 200000,
-    maxTokens: 128000,
-  },
-  "glm-4.5": {
-    name: "GLM-4.5",
-    reasoning: true,
-    contextWindow: 131072,
-    maxTokens: 98304,
-  },
-  "glm-4.5-flash": {
-    name: "GLM-4.5 Flash",
-    reasoning: true,
-    contextWindow: 131072,
-    maxTokens: 98304,
-  },
-} as const;
-
-export type ZaiModelId = keyof typeof MODELS;
+import crypto from "node:crypto";
+import {
+  loadAuth,
+  saveAuth,
+  generateSign,
+  extractRefreshToken,
+  extractAccessToken,
+  refreshAccessToken,
+  ZAI_API_BASE,
+  SIGN_SECRET,
+  X_EXP_GROUPS,
+  ASSISTANT_ID_MAP,
+  DEFAULT_ASSISTANT_ID,
+  type ZaiAuthState,
+} from "./auth.js";
 
 // ─── Types ────────────────────────────────────────────────────
 
-export interface ZaiConfig {
-  apiKey: string;
-  baseUrl: string;
-  defaultModel: ZaiModelId;
-}
-
 export interface ChatMessage {
-  role: "system" | "user" | "assistant" | "tool";
+  role: "system" | "user" | "assistant";
   content: string;
 }
 
-export interface ChatCompletionOptions {
-  model?: ZaiModelId;
-  messages: ChatMessage[];
-  temperature?: number;
-  topP?: number;
-  maxTokens?: number;
-  stream?: boolean;
-  tools?: ZaiTool[];
-  toolChoice?: "auto" | "none" | { type: "function"; function: { name: string } };
+export interface ChatOptions {
+  model?: string;
+  conversationId?: string;
+  systemPrompt?: string;
+  history?: ChatMessage[];
+  signal?: AbortSignal;
 }
 
-export interface ZaiTool {
-  type: "function";
-  function: {
-    name: string;
-    description: string;
-    parameters: Record<string, unknown>;
-  };
+export interface ChatResult {
+  text: string;
+  conversationId: string;
+  thinking?: string;
 }
 
-export interface ChatCompletionResponse {
-  id: string;
-  object: string;
-  created: number;
-  model: string;
-  choices: Array<{
-    index: number;
-    message: {
-      role: string;
-      content: string | null;
-      tool_calls?: Array<{
-        id: string;
-        type: "function";
-        function: {
-          name: string;
-          arguments: string;
-        };
-      }>;
-    };
-    finish_reason: string;
-  }>;
-  usage: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  };
+export interface StreamCallbacks {
+  onText?: (delta: string) => void;
+  onThinking?: (delta: string) => void;
+  onDone?: (fullText: string) => void;
+  onError?: (error: string) => void;
 }
 
-export interface StreamChunk {
-  id: string;
-  object: string;
-  created: number;
-  model: string;
-  choices: Array<{
-    index: number;
-    delta: {
-      role?: string;
-      content?: string;
-      tool_calls?: Array<{
-        index: number;
-        id?: string;
-        type?: string;
-        function?: {
-          name?: string;
-          arguments?: string;
-        };
-      }>;
-    };
-    finish_reason: string | null;
-  }>;
-}
+// ─── Client ───────────────────────────────────────────────────
 
-// ─── Config Persistence ───────────────────────────────────────
+export class ZaiZeroTokenClient {
+  private auth: ZaiAuthState;
+  private accessToken: string | null;
+  private deviceId: string;
+  private conversationMap: Map<string, string> = new Map();
 
-const CONFIG_DIR = join(homedir(), ".zai");
-const CONFIG_FILE = join(CONFIG_DIR, "config.json");
-
-export function getConfigDir(): string {
-  return CONFIG_DIR;
-}
-
-export function saveConfig(config: ZaiConfig): void {
-  if (!existsSync(CONFIG_DIR)) {
-    mkdirSync(CONFIG_DIR, { recursive: true });
-  }
-  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), { mode: 0o600 });
-}
-
-export function loadConfig(): ZaiConfig | null {
-  if (!existsSync(CONFIG_FILE)) {
-    return null;
-  }
-  try {
-    const raw = readFileSync(CONFIG_FILE, "utf-8");
-    return JSON.parse(raw) as ZaiConfig;
-  } catch {
-    return null;
-  }
-}
-
-export function isloggedIn(): boolean {
-  const config = loadConfig();
-  return config !== null && typeof config.apiKey === "string" && config.apiKey.length > 0;
-}
-
-// ─── API Client ───────────────────────────────────────────────
-
-export class ZaiClient {
-  private apiKey: string;
-  private baseUrl: string;
-  private defaultModel: ZaiModelId;
-
-  constructor(config?: Partial<ZaiConfig>) {
-    const saved = loadConfig();
-    this.apiKey = config?.apiKey ?? saved?.apiKey ?? "";
-    this.baseUrl = config?.baseUrl ?? saved?.baseUrl ?? ZAI_GLOBAL_BASE_URL;
-    this.defaultModel = config?.defaultModel ?? saved?.defaultModel ?? "glm-4.7-flash";
-
-    if (!this.apiKey) {
+  constructor(auth?: ZaiAuthState) {
+    this.auth = auth ?? loadAuth()!;
+    if (!this.auth) {
       throw new Error(
-        "Z.AI API key not found. Run `zai login` or set ZAI_API_KEY environment variable."
+        "Not logged in. Run `zai login` first to authenticate via browser."
       );
     }
+    this.accessToken = this.auth.accessToken;
+    this.deviceId = crypto.randomUUID().replace(/-/g, "");
+  }
+
+  private async ensureAccessToken(): Promise<string> {
+    // Try cached access token
+    if (this.accessToken) {
+      return this.accessToken;
+    }
+
+    // Try extracting from cookie
+    const fromCookie = extractAccessToken(this.auth.cookie);
+    if (fromCookie) {
+      this.accessToken = fromCookie;
+      return this.accessToken;
+    }
+
+    // Refresh using refresh token
+    const refreshToken = extractRefreshToken(this.auth.cookie) ?? this.auth.refreshToken;
+    if (!refreshToken) {
+      throw new Error("No refresh token available. Please run `zai login` again.");
+    }
+
+    console.log("[ZAI] Refreshing access token...");
+    this.accessToken = await refreshAccessToken(refreshToken);
+
+    // Update persisted auth
+    this.auth.accessToken = this.accessToken;
+    saveAuth(this.auth);
+
+    return this.accessToken;
   }
 
   /**
-   * Login: validate API key and persist config
+   * Build the request headers required by chat.z.ai
    */
-  static async login(apiKey: string, baseUrl?: string): Promise<ZaiClient> {
-    const url = baseUrl ?? ZAI_GLOBAL_BASE_URL;
-    // Validate by listing models or making a simple request
-    const response = await fetch(`${url}/models`, {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
+  private buildHeaders(accessToken: string): Record<string, string> {
+    const sign = generateSign();
+    const requestId = crypto.randomUUID().replace(/-/g, "");
+
+    return {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+      Authorization: `Bearer ${accessToken}`,
+      "App-Name": "chatglm",
+      Origin: ZAI_API_BASE,
+      "X-App-Platform": "pc",
+      "X-App-Version": "0.0.1",
+      "X-App-fr": "default",
+      "X-Device-Brand": "",
+      "X-Device-Id": this.deviceId,
+      "X-Device-Model": "",
+      "X-Exp-Groups": X_EXP_GROUPS,
+      "X-Lang": "zh",
+      "X-Nonce": sign.nonce,
+      "X-Request-Id": requestId,
+      "X-Sign": sign.sign,
+      "X-Timestamp": sign.timestamp,
+      Cookie: this.auth.cookie,
+    };
+  }
+
+  /**
+   * Build the request body for chat.z.ai assistant/stream API
+   */
+  private buildBody(message: string, model: string, conversationId?: string): string {
+    const assistantId = ASSISTANT_ID_MAP[model] ?? DEFAULT_ASSISTANT_ID;
+
+    return JSON.stringify({
+      assistant_id: assistantId,
+      conversation_id: conversationId || "",
+      project_id: "",
+      chat_type: "user_chat",
+      meta_data: {
+        cogview: { rm_label_watermark: false },
+        is_test: false,
+        input_question_type: "xxxx",
+        channel: "",
+        draft_id: "",
+        chat_mode: "zero",
+        is_networking: false,
+        quote_log_id: "",
+        platform: "pc",
       },
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: message }],
+        },
+      ],
     });
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Login failed (${response.status}): ${text}`);
-    }
-
-    const config: ZaiConfig = {
-      apiKey,
-      baseUrl: url,
-      defaultModel: "glm-4.7-flash",
-    };
-    saveConfig(config);
-    return new ZaiClient(config);
   }
 
   /**
-   * Logout: remove persisted config
+   * Chat with streaming - real-time callbacks
    */
-  static logout(): void {
-    if (existsSync(CONFIG_FILE)) {
-      unlinkSync(CONFIG_FILE);
+  async chatStream(
+    message: string,
+    callbacks: StreamCallbacks = {},
+    options: ChatOptions = {},
+  ): Promise<ChatResult> {
+    const accessToken = await this.ensureAccessToken();
+    const model = options.model ?? "glm-4";
+    const sessionKey = options.conversationId ?? "default";
+    const conversationId = this.conversationMap.get(sessionKey);
+
+    // Build prompt with history if provided
+    let prompt = message;
+    if (options.history && options.history.length > 0) {
+      const parts: string[] = [];
+      if (options.systemPrompt) {
+        parts.push(`System: ${options.systemPrompt}`);
+      }
+      for (const msg of options.history) {
+        const role = msg.role === "user" ? "User" : "Assistant";
+        parts.push(`${role}: ${msg.content}`);
+      }
+      parts.push(`User: ${message}`);
+      prompt = parts.join("\n\n");
+    } else if (options.systemPrompt) {
+      prompt = `${options.systemPrompt}\n\nUser: ${message}`;
     }
-  }
 
-  /**
-   * Chat completion (non-streaming)
-   */
-  async chatCompletion(options: ChatCompletionOptions): Promise<ChatCompletionResponse> {
-    const model = options.model ?? this.defaultModel;
-    const url = `${this.baseUrl}/chat/completions`;
+    const headers = this.buildHeaders(accessToken);
+    const body = this.buildBody(prompt, model, conversationId);
 
-    const body: Record<string, unknown> = {
-      model,
-      messages: options.messages,
-      stream: false,
-    };
+    console.log(`[ZAI] Sending request... model=${model} conversationId=${conversationId || "new"}`);
 
-    if (options.temperature !== undefined) body.temperature = options.temperature;
-    if (options.topP !== undefined) body.top_p = options.topP;
-    if (options.maxTokens !== undefined) body.max_tokens = options.maxTokens;
-    if (options.tools) body.tools = options.tools;
-    if (options.toolChoice) body.tool_choice = options.toolChoice;
-
-    const response = await fetch(url, {
+    const res = await fetch(`${ZAI_API_BASE}/chatglm/backend-api/assistant/stream`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify(body),
+      headers,
+      body,
+      signal: options.signal,
     });
 
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Chat completion failed (${response.status}): ${text}`);
+    if (!res.ok) {
+      if (res.status === 401) {
+        // Token expired, refresh and retry
+        console.log("[ZAI] Token expired, refreshing...");
+        this.accessToken = null;
+        const newToken = await this.ensureAccessToken();
+        const retryHeaders = this.buildHeaders(newToken);
+        const retryRes = await fetch(`${ZAI_API_BASE}/chatglm/backend-api/assistant/stream`, {
+          method: "POST",
+          headers: retryHeaders,
+          body,
+          signal: options.signal,
+        });
+
+        if (!retryRes.ok) {
+          const errText = await retryRes.text();
+          callbacks.onError?.(`API error after retry (${retryRes.status}): ${errText.substring(0, 200)}`);
+          throw new Error(`API error (${retryRes.status}): ${errText.substring(0, 200)}`);
+        }
+
+        return this.processStreamResponse(retryRes, callbacks, sessionKey);
+      }
+
+      const errText = await res.text();
+      callbacks.onError?.(`API error (${res.status}): ${errText.substring(0, 200)}`);
+      throw new Error(`API error (${res.status}): ${errText.substring(0, 200)}`);
     }
 
-    return (await response.json()) as ChatCompletionResponse;
+    return this.processStreamResponse(res, callbacks, sessionKey);
   }
 
-  /**
-   * Chat completion (streaming) - returns async generator of chunks
-   */
-  async *chatCompletionStream(
-    options: ChatCompletionOptions
-  ): AsyncGenerator<StreamChunk, void, unknown> {
-    const model = options.model ?? this.defaultModel;
-    const url = `${this.baseUrl}/chat/completions`;
-
-    const body: Record<string, unknown> = {
-      model,
-      messages: options.messages,
-      stream: true,
-      tool_stream: true,
-    };
-
-    if (options.temperature !== undefined) body.temperature = options.temperature;
-    if (options.topP !== undefined) body.top_p = options.topP;
-    if (options.maxTokens !== undefined) body.max_tokens = options.maxTokens;
-    if (options.tools) body.tools = options.tools;
-    if (options.toolChoice) body.tool_choice = options.toolChoice;
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify(body),
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Stream failed (${response.status}): ${text}`);
-    }
-
-    const reader = response.body?.getReader();
+  private async processStreamResponse(
+    res: Response,
+    callbacks: StreamCallbacks,
+    sessionKey: string,
+  ): Promise<ChatResult> {
+    const reader = res.body?.getReader();
     if (!reader) throw new Error("No response body");
 
     const decoder = new TextDecoder();
     let buffer = "";
+    let accumulatedContent = "";
+    let currentMode: string = "text";
+    let thinkingContent = "";
+    let capturedConversationId = "";
+    let tagBuffer = "";
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    const emitDelta = (delta: string) => {
+      tagBuffer += delta;
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
+      const checkTags = () => {
+        const thinkStart = tagBuffer.match(/<think\b[^<>]*>/i);
+        const thinkEnd = tagBuffer.match(/<\/think\b[^<>]*>/i);
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data:")) continue;
+        const indices = [
+          { type: "think_start", idx: thinkStart?.index ?? -1, len: thinkStart?.[0].length ?? 0 },
+          { type: "think_end", idx: thinkEnd?.index ?? -1, len: thinkEnd?.[0].length ?? 0 },
+        ]
+          .filter((t) => t.idx !== -1)
+          .toSorted((a, b) => a.idx - b.idx);
 
-        const data = trimmed.slice(5).trim();
-        if (data === "[DONE]") return;
-
-        try {
-          const chunk = JSON.parse(data) as StreamChunk;
-          yield chunk;
-        } catch {
-          // Skip malformed chunks
+        if (indices.length > 0) {
+          const first = indices[0];
+          const before = tagBuffer.slice(0, first.idx);
+          if (before) {
+            if (currentMode === "thinking") {
+              thinkingContent += before;
+              callbacks.onThinking?.(before);
+            } else {
+              accumulatedContent += before;
+              callbacks.onText?.(before);
+            }
+          }
+          if (first.type === "think_start") {
+            currentMode = "thinking";
+          } else if (first.type === "think_end") {
+            currentMode = "text";
+          }
+          tagBuffer = tagBuffer.slice(first.idx + first.len);
+          checkTags();
+        } else {
+          const lastAngle = tagBuffer.lastIndexOf("<");
+          if (lastAngle === -1) {
+            if (currentMode === "thinking") {
+              thinkingContent += tagBuffer;
+              callbacks.onThinking?.(tagBuffer);
+            } else {
+              accumulatedContent += tagBuffer;
+              callbacks.onText?.(tagBuffer);
+            }
+            tagBuffer = "";
+          } else if (lastAngle > 0) {
+            const safe = tagBuffer.slice(0, lastAngle);
+            if (currentMode === "thinking") {
+              thinkingContent += safe;
+              callbacks.onThinking?.(safe);
+            } else {
+              accumulatedContent += safe;
+              callbacks.onText?.(safe);
+            }
+            tagBuffer = tagBuffer.slice(lastAngle);
+          }
         }
-      }
-    }
-  }
+      };
 
-  /**
-   * Simple chat: send a message, get a text response
-   */
-  async chat(
-    message: string,
-    options?: {
-      system?: string;
-      model?: ZaiModelId;
-      temperature?: number;
-      history?: ChatMessage[];
-    }
-  ): Promise<string> {
-    const messages: ChatMessage[] = [];
+      checkTags();
+    };
 
-    if (options?.system) {
-      messages.push({ role: "system", content: options.system });
-    }
+    const processLine = (line: string) => {
+      if (!line || !line.startsWith("data:")) return;
 
-    if (options?.history) {
-      messages.push(...options.history);
-    }
+      const dataStr = line.slice(5).trim();
+      if (dataStr === "[DONE]" || !dataStr) return;
 
-    messages.push({ role: "user", content: message });
+      try {
+        const data = JSON.parse(dataStr);
 
-    const response = await this.chatCompletion({
-      model: options?.model,
-      messages,
-      temperature: options?.temperature,
-    });
-
-    return response.choices[0]?.message?.content ?? "";
-  }
-
-  /**
-   * Simple chat with streaming output
-   */
-  async chatStream(
-    message: string,
-    onChunk: (text: string) => void,
-    options?: {
-      system?: string;
-      model?: ZaiModelId;
-      temperature?: number;
-      history?: ChatMessage[];
-    }
-  ): Promise<string> {
-    const messages: ChatMessage[] = [];
-
-    if (options?.system) {
-      messages.push({ role: "system", content: options.system });
-    }
-
-    if (options?.history) {
-      messages.push(...options.history);
-    }
-
-    messages.push({ role: "user", content: message });
-
-    let fullText = "";
-
-    for await (const chunk of this.chatCompletionStream({
-      model: options?.model,
-      messages,
-      temperature: options?.temperature,
-    })) {
-      const delta = chunk.choices[0]?.delta;
-      if (delta?.content) {
-        fullText += delta.content;
-        onChunk(delta.content);
-      }
-    }
-
-    return fullText;
-  }
-
-  /**
-   * Agent loop: LLM ↔ Tool calling cycle
-   */
-  async agentLoop(options: {
-    messages: ChatMessage[];
-    tools: ZaiTool[];
-    model?: ZaiModelId;
-    maxRounds?: number;
-    onToolCall?: (toolName: string, args: string) => Promise<string>;
-    onText?: (text: string) => void;
-  }): Promise<ChatMessage[]> {
-    const maxRounds = options.maxRounds ?? 10;
-    const messages = [...options.messages];
-    const conversation: ChatMessage[] = [...messages];
-
-    for (let round = 0; round < maxRounds; round++) {
-      let fullContent = "";
-      let toolCalls: Array<{
-        id: string;
-        type: "function";
-        function: { name: string; arguments: string };
-      }> = [];
-
-      // Collect response (streaming for text, but we need full tool_calls)
-      for await (const chunk of this.chatCompletionStream({
-        model: options.model,
-        messages: conversation,
-        tools: options.tools,
-      })) {
-        const delta = chunk.choices[0]?.delta;
-        if (delta?.content) {
-          fullContent += delta.content;
-          options.onText?.(delta.content);
+        // Capture conversation ID
+        if (data.conversation_id) {
+          capturedConversationId = data.conversation_id;
+          this.conversationMap.set(sessionKey, data.conversation_id);
         }
-        if (delta?.tool_calls) {
-          for (const tc of delta.tool_calls) {
-            if (tc.index !== undefined) {
-              if (!toolCalls[tc.index]) {
-                toolCalls[tc.index] = {
-                  id: tc.id ?? "",
-                  type: "function" as const,
-                  function: { name: "", arguments: "" },
-                };
+
+        // Extract text delta
+        let delta = "";
+
+        if (data.parts && Array.isArray(data.parts)) {
+          for (const part of data.parts) {
+            if (part && typeof part === "object") {
+              const content = (part as any).content;
+              if (Array.isArray(content)) {
+                for (const c of content) {
+                  if (c && typeof c === "object" && c.type === "text" && typeof c.text === "string") {
+                    delta = c.text;
+                    break;
+                  }
+                }
               }
-              if (tc.function?.name) {
-                toolCalls[tc.index].function.name += tc.function.name;
-              }
-              if (tc.function?.arguments) {
-                toolCalls[tc.index].function.arguments += tc.function.arguments;
-              }
+              if (delta) break;
             }
           }
         }
+
+        if (!delta) {
+          delta = data.text || data.content || data.delta || "";
+        }
+
+        if (typeof delta === "string" && delta) {
+          // GLM sends full accumulated content — only emit new portion
+          if (delta.length > accumulatedContent.length + thinkingContent.length) {
+            // Need to figure out what's new
+            const newDelta = delta.slice(accumulatedContent.length);
+            if (newDelta) {
+              emitDelta(newDelta);
+            }
+          }
+        }
+      } catch {
+        // Ignore parse errors
       }
+    };
 
-      // Build assistant message
-      const assistantMessage: ChatMessage = {
-        role: "assistant",
-        content: fullContent || "",
-      };
-      conversation.push(assistantMessage);
-
-      // No tool calls → done
-      if (toolCalls.length === 0) {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        if (buffer.trim()) processLine(buffer.trim());
         break;
       }
 
-      // Execute tool calls
-      for (const tc of toolCalls) {
-        const result = await options.onToolCall?.(tc.function.name, tc.function.arguments) ?? "";
-        conversation.push({
-          role: "tool",
-          content: result,
-        });
+      const chunk = decoder.decode(value, { stream: true });
+      const combined = buffer + chunk;
+      const parts = combined.split("\n");
+      buffer = parts.pop() || "";
+
+      for (const part of parts) {
+        processLine(part.trim());
       }
     }
 
-    return conversation;
+    // Flush remaining tag buffer
+    if (tagBuffer) {
+      if (currentMode === "thinking") {
+        thinkingContent += tagBuffer;
+        callbacks.onThinking?.(tagBuffer);
+      } else {
+        accumulatedContent += tagBuffer;
+        callbacks.onText?.(tagBuffer);
+      }
+    }
+
+    callbacks.onDone?.(accumulatedContent);
+
+    return {
+      text: accumulatedContent,
+      conversationId: capturedConversationId,
+      thinking: thinkingContent || undefined,
+    };
+  }
+
+  /**
+   * Simple chat - returns full text (no streaming)
+   */
+  async chat(message: string, options: ChatOptions = {}): Promise<ChatResult> {
+    return this.chatStream(message, {}, options);
   }
 }

@@ -1,35 +1,46 @@
 /**
- * Z.AI SDK - Main entry point
+ * Z.AI Zero-Token SDK - Main entry point
  *
- * Re-exports the client and utilities for programmatic use.
+ * Re-exports everything for programmatic use.
  *
  * Usage:
- *   import { ZaiClient } from "zai";
- *   const client = new ZaiClient();
- *   const text = await client.chat("Hello!");
+ *   import { loginViaBrowser, ZaiZeroTokenClient } from "zai";
+ *   await loginViaBrowser();
+ *   const client = new ZaiZeroTokenClient();
+ *   const result = await client.chat("Hello!");
  */
 
 export {
-  ZaiClient,
-  ZAI_GLOBAL_BASE_URL,
-  ZAI_CN_BASE_URL,
-  MODELS,
-  isloggedIn,
-  loadConfig,
-  saveConfig,
+  loginViaBrowser,
+  isLoggedIn,
+  loadAuth,
+  saveAuth,
+  clearAuth,
+  generateSign,
+  extractRefreshToken,
+  extractAccessToken,
+  refreshAccessToken,
   getConfigDir,
-} from "./client.js";
+  ZAI_CHAT_URL,
+  ZAI_API_BASE,
+  SIGN_SECRET,
+  ASSISTANT_ID_MAP,
+  DEFAULT_ASSISTANT_ID,
+} from "./auth.js";
 
+export { ZaiZeroTokenClient } from "./client.js";
 export { startServer } from "./server.js";
 
 export type {
-  ZaiConfig,
+  ZaiAuthState,
+  LoginOptions,
+} from "./auth.js";
+
+export type {
   ChatMessage,
-  ChatCompletionOptions,
-  ChatCompletionResponse,
-  StreamChunk,
-  ZaiTool,
-  ZaiModelId,
+  ChatOptions,
+  ChatResult,
+  StreamCallbacks,
 } from "./client.js";
 
 export type { ServerOptions } from "./server.js";
