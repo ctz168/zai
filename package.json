@@ -1,0 +1,25 @@
+{
+  "name": "zai",
+  "version": "1.0.0",
+  "description": "Standalone Z.AI API wrapper - login once, call forever via API",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "zai": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsc && node dist/server.js",
+    "cli": "tsc && node dist/cli.js"
+  },
+  "keywords": ["zai", "z.ai", "glm", "api", "chatbot"],
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
