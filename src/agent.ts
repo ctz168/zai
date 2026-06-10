@@ -652,6 +652,11 @@ export class ZaiAgentRuntime {
   private _registerMessageHandlers(): void {
     if (!this._serverClient) return;
 
+    // Debug: log ALL incoming messages
+    this._serverClient.onMessage("*", (data: any) => {
+      console.log(`[Agent] 🔔 WS message type="${data.type}" from=${data.from || data.fromId || "?"} data=${JSON.stringify(data).substring(0, 200)}`);
+    });
+
     this._serverClient.onMessage("relay", (data: any) => {
       this._processIncomingMessage(data, false);
     });
@@ -666,6 +671,30 @@ export class ZaiAgentRuntime {
 
     this._serverClient.onMessage("handshake_initiate", (data: any) => {
       this._handleIncomingFriendRequest(data);
+    });
+
+    // Also handle friend_request_accepted
+    this._serverClient.onMessage("friend_request_accepted", (data: any) => {
+      console.log(`[Agent] 🤝 Friend request accepted: ${JSON.stringify(data).substring(0, 200)}`);
+    });
+
+    // Handle unread_counts — the AICQ server doesn't push message content via WS.
+    // It only sends unread_counts notification. We must fetch messages via REST API.
+    this._serverClient.onMessage("unread_counts", (data: any) => {
+      this._handleUnreadCounts(data);
+    });
+
+    // Also handle direct message types that aicq.online might use
+    this._serverClient.onMessage("dm", (data: any) => {
+      this._processIncomingMessage(data, false);
+    });
+
+    this._serverClient.onMessage("chat", (data: any) => {
+      this._processIncomingMessage(data, false);
+    });
+
+    this._serverClient.onMessage("private_message", (data: any) => {
+      this._processIncomingMessage(data, false);
     });
 
     console.log("[Agent] Message handlers registered");
@@ -730,6 +759,78 @@ export class ZaiAgentRuntime {
         } catch (e: any) {
           console.error("[Agent] Failed to accept friend request:", e.message);
         }
+      }
+    }
+  }
+
+  /**
+   * Handle unread_counts notification from AICQ server.
+   * The server does NOT push actual message content via WS — it only
+   * sends a count of unread messages per friend. We must fetch the
+   * actual messages via the REST API /api/v1/chat/conversation/{friendId}
+   */
+  private async _handleUnreadCounts(data: any): Promise<void> {
+    const unread = data.unread || {};
+    console.log(`[Agent] 📬 Unread counts: ${JSON.stringify(unread)}`);
+
+    for (const [friendId, count] of Object.entries(unread)) {
+      if (typeof count !== "number" || count <= 0) continue;
+
+      console.log(`[Agent] Fetching ${count} unread message(s) from ${friendId}...`);
+
+      try {
+        const jwt = this._serverClient?.jwtToken || this._jwtToken;
+        if (!jwt) {
+          console.error("[Agent] No JWT token available for fetching messages");
+          continue;
+        }
+
+        const apiUrl = `${this.config.serverUrl}/api/v1/chat/conversation/${friendId}?limit=${count}`;
+        const res = await fetch(apiUrl, {
+          headers: { Authorization: `Bearer ${jwt}` },
+        });
+
+        if (!res.ok) {
+          console.error(`[Agent] Failed to fetch conversation: ${res.status}`);
+          continue;
+        }
+
+        const convData = await res.json() as any;
+        const messages = convData.messages || [];
+
+        for (const msg of messages) {
+          // Skip messages from ourselves
+          if (msg.from_id === this._serverAccountId || msg.fromId === this._serverAccountId) continue;
+
+          const content = msg.content || msg.text || "";
+          if (!content || !content.trim()) continue;
+
+          const fromId = msg.from_id || msg.fromId || friendId;
+          console.log(`[Agent] 📩 [fetched] Message from ${fromId}: ${content.substring(0, 80)}`);
+
+          // Process as incoming message
+          await this._processIncomingMessage(
+            { from: fromId, fromId, data: content, payload: content },
+            false,
+          );
+        }
+
+        // Mark as read
+        try {
+          await fetch(`${this.config.serverUrl}/api/v1/chat/mark-read`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${jwt}`,
+            },
+            body: JSON.stringify({ friend_id: friendId }),
+          });
+          console.log(`[Agent] ✅ Marked messages from ${friendId} as read`);
+        } catch {
+          // Ignore mark-read errors
+        }
+      } catch (e: any) {
+        console.error(`[Agent] Error fetching unread from ${friendId}: ${e.message}`);
       }
     }
   }
@@ -801,9 +902,50 @@ export class ZaiAgentRuntime {
         this.memory.add(chatId, "assistant", result.text);
         await this._sendReply(chatId, result.text, isGroup);
       } catch (e2: any) {
-        throw new Error(`Chat failed: ${e2.message} / ${e2.message}`);
+        // Web API failed — try z-ai-web-dev-sdk as fallback (uses internal API)
+        console.log("[Agent] Web API failed, trying internal SDK...");
+        try {
+          const reply = await this._chatViaSDK(userMessage, history);
+          this.memory.add(chatId, "assistant", reply);
+          await this._sendReply(chatId, reply, isGroup);
+        } catch (e3: any) {
+          throw new Error(`Chat failed: ${e2.message} / SDK: ${e3.message}`);
+        }
       }
     }
+  }
+
+  /**
+   * Fallback: use z-ai-web-dev-sdk (internal API) when the web cookie-based
+   * API is unavailable. This reads /etc/.z-ai-config or ~/.z-ai-config.
+   */
+  private async _chatViaSDK(
+    userMessage: string,
+    history: ConversationMessage[],
+  ): Promise<string> {
+    // Dynamic import of the ESM module
+    const { default: ZAI } = await import("z-ai-web-dev-sdk");
+    const zai = await ZAI.create();
+
+    const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [];
+    if (this.config.systemPrompt) {
+      messages.push({ role: "system", content: this.config.systemPrompt });
+    }
+    for (const h of history.slice(-20)) {
+      messages.push({ role: h.role, content: h.content });
+    }
+    messages.push({ role: "user", content: userMessage });
+
+    const completion = await zai.chat.completions.create({
+      model: this.config.model,
+      messages,
+    });
+
+    const content = completion.choices?.[0]?.message?.content;
+    if (!content) {
+      throw new Error("Empty response from SDK");
+    }
+    return content;
   }
 
   private async _streamReplyChunks(

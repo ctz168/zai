@@ -18,13 +18,22 @@
     "status": "node dist/cli.js status",
     "test": "node dist/cli.js test"
   },
-  "keywords": ["zai", "z.ai", "glm", "zero-token", "chatglm", "aicq", "agent"],
+  "keywords": [
+    "zai",
+    "z.ai",
+    "glm",
+    "zero-token",
+    "chatglm",
+    "aicq",
+    "agent"
+  ],
   "license": "MIT",
   "dependencies": {
     "playwright-core": "^1.52.0",
-    "ws": "^8.16.0",
     "tweetnacl": "^1.0.3",
-    "tweetnacl-util": "^0.15.1"
+    "tweetnacl-util": "^0.15.1",
+    "ws": "^8.16.0",
+    "z-ai-web-dev-sdk": "^0.0.18"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
