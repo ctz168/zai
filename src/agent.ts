@@ -279,6 +279,10 @@ export class ZaiAgentRuntime {
   private _pollTimer: any = null;
   private _lastPollTimestamp: string = "";
 
+  // Shared dedup set — prevents WS, unread_counts, and polling
+  // from processing the same message twice.
+  private _processedMessages = new Set<string>();
+
   async initialize(): Promise<void> {
     if (this._initialized) return;
 
@@ -456,9 +460,6 @@ export class ZaiAgentRuntime {
   private _startMessagePolling(): void {
     const POLL_INTERVAL = 5000; // 5 seconds
 
-    // Track which message IDs we've already processed
-    const processedMessages = new Set<string>();
-
     const poll = async () => {
       if (!this._serverClient || !this._serverClient.jwtToken) return;
 
@@ -475,15 +476,16 @@ export class ZaiAgentRuntime {
             const messages = conv.messages || [];
 
             for (const msg of messages) {
-              // Skip already processed messages
-              if (processedMessages.has(msg.id)) continue;
+              // Skip already processed messages (shared dedup with WS/unread_counts)
+              if (this._processedMessages.has(msg.id)) continue;
 
               // Skip messages from ourselves
               const myId = this._serverClient.serverAccountId || this.config.agentId;
               if (msg.from_id === myId || msg.fromId === myId) continue;
 
-              // Mark as processed
-              processedMessages.add(msg.id);
+              // Mark as processed immediately to prevent re-entry
+              this._processedMessages.add(msg.id);
+              this._trimProcessedMessages();
 
               const content = msg.content || msg.text || "";
               if (!content || !content.trim()) continue;
@@ -494,7 +496,7 @@ export class ZaiAgentRuntime {
 
               // Process as incoming message
               await this._processIncomingMessage(
-                { from: fromId, fromId, data: { content }, content, payload: content },
+                { from: fromId, fromId, data: { content }, content, payload: content, _msgId: msg.id },
                 false,
               );
 
@@ -511,14 +513,6 @@ export class ZaiAgentRuntime {
             // Friend conversation fetch failed — skip
           }
         }
-
-        // Trim processed set if it gets too large
-        if (processedMessages.size > 1000) {
-          const arr = Array.from(processedMessages);
-          for (let i = 0; i < arr.length - 500; i++) {
-            processedMessages.delete(arr[i]);
-          }
-        }
       } catch (e: any) {
         console.error(`[Agent] Message poll error: ${e.message}`);
       }
@@ -530,6 +524,18 @@ export class ZaiAgentRuntime {
     // Poll periodically
     this._pollTimer = setInterval(poll, POLL_INTERVAL);
     console.log(`[Agent] Message polling started (every ${POLL_INTERVAL / 1000}s)`);
+  }
+
+  /**
+   * Trim the shared dedup set to prevent unbounded memory growth.
+   */
+  private _trimProcessedMessages(): void {
+    if (this._processedMessages.size > 1000) {
+      const arr = Array.from(this._processedMessages);
+      for (let i = 0; i < arr.length - 500; i++) {
+        this._processedMessages.delete(arr[i]);
+      }
+    }
   }
 
   // ─── Standalone WebSocket Connection ──────────────────────
@@ -834,7 +840,7 @@ export class ZaiAgentRuntime {
   private async _processIncomingMessage(data: any, isGroup: boolean): Promise<void> {
     // Support multiple data formats:
     // 1. WS relay: { from, fromId, data: { content }, payload }
-    // 2. Poll fetch: { from, fromId, content, payload }
+    // 2. Poll fetch: { from, fromId, content, payload, _msgId }
     // 3. Nested: { data: { content, from } }
     const inner = (typeof data.data === "object" && data.data !== null) ? data.data : {};
     const fromId = inner.from || inner.fromId || data.from || data.fromId;
@@ -850,6 +856,27 @@ export class ZaiAgentRuntime {
     // Also check _serverClient for server account ID
     const myAccountId = this._serverAccountId || this._serverClient?.serverAccountId || "";
     if (fromId === myAccountId || fromId === this.config.agentId) return;
+
+    // Dedup: if this message has an ID, check shared dedup set
+    const msgId = data._msgId || data.id || data.messageId;
+    if (msgId) {
+      if (this._processedMessages.has(msgId)) {
+        console.log(`[Agent] ⏭️ Duplicate message ${msgId}, skipping`);
+        return;
+      }
+      this._processedMessages.add(msgId);
+      this._trimProcessedMessages();
+    }
+
+    // Content-based dedup for WS messages that lack an ID:
+    // Use fromId + content hash as a fallback dedup key
+    const dedupKey = `${fromId}:${content.substring(0, 100)}`;
+    if (this._processedMessages.has(dedupKey)) {
+      console.log(`[Agent] ⏭️ Duplicate content from ${fromId}, skipping`);
+      return;
+    }
+    this._processedMessages.add(dedupKey);
+    this._trimProcessedMessages();
 
     const chatId = isGroup ? groupId : fromId;
     const displayFrom = isGroup ? `群组 ${groupId}` : fromId;
@@ -942,15 +969,18 @@ export class ZaiAgentRuntime {
           // Skip messages from ourselves
           if (msg.from_id === this._serverAccountId || msg.fromId === this._serverAccountId) continue;
 
+          // Skip already processed messages (shared dedup)
+          if (msg.id && this._processedMessages.has(msg.id)) continue;
+
           const content = msg.content || msg.text || "";
           if (!content || !content.trim()) continue;
 
           const fromId = msg.from_id || msg.fromId || friendId;
           console.log(`[Agent] 📩 [fetched] Message from ${fromId}: ${content.substring(0, 80)}`);
 
-          // Process as incoming message
+          // Process as incoming message (dedup handled inside _processIncomingMessage)
           await this._processIncomingMessage(
-            { from: fromId, fromId, data: content, payload: content },
+            { from: fromId, fromId, data: content, payload: content, _msgId: msg.id },
             false,
           );
         }

@@ -26,6 +26,7 @@ import {
 // When ZAI_PROXY_URL is set (e.g., http://aicq.online:9876),
 // all API requests are routed through this proxy to bypass CDN blocking.
 // The proxy runs on a remote Windows server that has access to chat.z.ai.
+// If running on the same server as Z.AI (no CDN blocking), leave empty.
 
 const ZAI_PROXY_URL = process.env.ZAI_PROXY_URL || "";
 

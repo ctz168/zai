@@ -244,8 +244,8 @@ async function cmdAgent(flags: Record<string, string>) {
 
 async function cmdAgentWorker(flags: Record<string, string>) {
   if (!isLoggedIn()) {
-    console.error("❌ Not logged in to Z.AI. Run `zai login` first.");
-    process.exit(1);
+    console.log("⚠️  No Z.AI cookie login. Cookie API disabled, will use SDK as AI backend.");
+    console.log("   Run `zai login` to enable cookie-based API (preferred).");
   }
 
   console.log("\n🤖 Starting ZAI Agent...\n");
