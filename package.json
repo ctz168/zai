@@ -1,7 +1,7 @@
 {
   "name": "zai",
-  "version": "2.0.0",
-  "description": "Z.AI Zero-Token - login via browser, call API forever without API key",
+  "version": "2.1.0",
+  "description": "Z.AI Zero-Token - login via browser, call API forever without API key, plus AICQ Agent mode",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -11,15 +11,26 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "dev": "tsc && node dist/server.js",
-    "cli": "tsc && node dist/cli.js"
+    "cli": "tsc && node dist/cli.js",
+    "agent": "tsc && node dist/cli.js agent"
   },
-  "keywords": ["zai", "z.ai", "glm", "zero-token", "chatglm"],
+  "keywords": ["zai", "z.ai", "glm", "zero-token", "chatglm", "aicq", "agent"],
   "license": "MIT",
   "dependencies": {
-    "playwright-core": "^1.52.0"
+    "playwright-core": "^1.52.0",
+    "ws": "^8.16.0",
+    "tweetnacl": "^1.0.3",
+    "tweetnacl-util": "^0.15.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
     "typescript": "^5.7.0"
+  },
+  "optionalDependencies": {
+    "aicq-chat-plugin": "^3.9.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

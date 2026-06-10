@@ -8,6 +8,10 @@
  *   await loginViaBrowser();
  *   const client = new ZaiZeroTokenClient();
  *   const result = await client.chat("Hello!");
+ *
+ * Agent Mode:
+ *   import { startAgent, ZaiAgentRuntime } from "zai";
+ *   const runtime = await startAgent({ nickname: "My Bot" });
  */
 
 export {
@@ -31,6 +35,14 @@ export {
 export { ZaiZeroTokenClient } from "./client.js";
 export { startServer } from "./server.js";
 
+export {
+  startAgent,
+  ZaiAgentRuntime,
+  loadAgentConfig,
+  saveAgentConfig,
+  getDefaultAgentConfig,
+} from "./agent.js";
+
 export type {
   ZaiAuthState,
   LoginOptions,
@@ -42,5 +54,10 @@ export type {
   ChatResult,
   StreamCallbacks,
 } from "./client.js";
+
+export type {
+  AgentConfig,
+  AgentStatus,
+} from "./agent.js";
 
 export type { ServerOptions } from "./server.js";
