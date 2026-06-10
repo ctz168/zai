@@ -12,7 +12,11 @@
     "start": "node dist/server.js",
     "dev": "tsc && node dist/server.js",
     "cli": "tsc && node dist/cli.js",
-    "agent": "tsc && node dist/cli.js agent"
+    "agent": "tsc && node dist/cli.js agent",
+    "login": "node dist/cli.js login",
+    "chat": "node dist/cli.js chat",
+    "status": "node dist/cli.js status",
+    "test": "node dist/cli.js test"
   },
   "keywords": ["zai", "z.ai", "glm", "zero-token", "chatglm", "aicq", "agent"],
   "license": "MIT",
