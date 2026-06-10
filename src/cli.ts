@@ -29,6 +29,15 @@ import {
   ZaiAgentRuntime,
   type AgentConfig,
 } from "./agent.js";
+import {
+  launchDaemon,
+  stopDaemon,
+  restartDaemon,
+  daemonStatus,
+  daemonLogTail,
+  runInternalDaemon,
+  runSupervisor,
+} from "./daemon.js";
 
 // ─── Parse Args ───────────────────────────────────────────────
 
@@ -172,6 +181,68 @@ async function cmdServe(flags: Record<string, string>) {
 // ─── Agent Commands ───────────────────────────────────────────
 
 async function cmdAgent(flags: Record<string, string>) {
+  // ─── Internal daemon flags (used by double-fork machinery) ──
+  // Note: --_internal-daemon parses to flags["_internal-daemon"] (with underscore)
+  if (flags["_internal-daemon"]) {
+    if (process.env.ZAI_DAEMON_ROLE === "supervisor") {
+      // We are the supervisor process
+      runSupervisor();
+      return;
+    }
+    // We are the intermediate process — fork supervisor and exit
+    runInternalDaemon();
+    return;
+  }
+
+  if (flags["_internal-worker"]) {
+    // We are the agent worker process (spawned by supervisor)
+    await cmdAgentWorker(flags);
+    return;
+  }
+
+  // ─── Daemon control commands ───────────────────────────────
+  if (flags["daemon"] !== undefined) {
+    const daemonAction = flags["daemon"];
+
+    if (daemonAction === "stop") {
+      stopDaemon();
+      return;
+    }
+    if (daemonAction === "restart") {
+      restartDaemon({
+        name: flags["name"] ?? flags["n"],
+        server: flags["server"] ?? flags["s"],
+        model: flags["model"] ?? flags["m"],
+        prompt: flags["prompt"],
+        master: flags["master"],
+      });
+      return;
+    }
+    if (daemonAction === "status") {
+      daemonStatus();
+      return;
+    }
+    if (daemonAction === "log") {
+      daemonLogTail(parseInt(flags["lines"] ?? "30", 10));
+      return;
+    }
+
+    // Default: --daemon (no value or --daemon true) → launch daemon
+    launchDaemon({
+      name: flags["name"] ?? flags["n"],
+      server: flags["server"] ?? flags["s"],
+      model: flags["model"] ?? flags["m"],
+      prompt: flags["prompt"],
+      master: flags["master"],
+    });
+    return;
+  }
+
+  // ─── Normal foreground mode ────────────────────────────────
+  await cmdAgentWorker(flags);
+}
+
+async function cmdAgentWorker(flags: Record<string, string>) {
   if (!isLoggedIn()) {
     console.error("❌ Not logged in to Z.AI. Run `zai login` first.");
     process.exit(1);
@@ -356,6 +427,14 @@ Agent Options:
   --server URL      AICQ server URL (default: https://aicq.online)
   --model MODEL     LLM model to use (default: glm-4-plus)
   --prompt TEXT     System prompt for the agent
+  --master ID       Set initial master (friend ID)
+
+Daemon Options (double-fork process guardian):
+  --daemon          Start agent as daemon (background, survives logout)
+  --daemon stop     Stop the daemon
+  --daemon restart  Restart the daemon
+  --daemon status   Check daemon status
+  --daemon log      View daemon log (--lines N, default 30)
 
 Agent Config Commands:
   zai agent-config show                      Show current config
@@ -373,6 +452,11 @@ Examples:
   zai serve --port 8080
   zai agent --name "My Bot"                     # Start AICQ agent
   zai agent --model glm-4-plus                  # Use specific model
+  zai agent --daemon                            # Start as daemon (background)
+  zai agent --daemon --master 1000000           # Daemon with initial master
+  zai agent --daemon stop                       # Stop daemon
+  zai agent --daemon status                     # Check daemon status
+  zai agent --daemon log                        # View daemon log
   zai agent-config master add friend_abc123     # Set a master
 
 Agent Mode:

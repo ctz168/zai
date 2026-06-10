@@ -43,6 +43,17 @@ export {
   getDefaultAgentConfig,
 } from "./agent.js";
 
+export {
+  launchDaemon,
+  stopDaemon,
+  restartDaemon,
+  daemonStatus,
+  daemonLogTail,
+  getPidFile,
+  getLogFile,
+  RUN_DIR as DAEMON_RUN_DIR,
+} from "./daemon.js";
+
 export type {
   ZaiAuthState,
   LoginOptions,

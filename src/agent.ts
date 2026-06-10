@@ -948,26 +948,45 @@ export class ZaiAgentRuntime {
 
   async addFriend(friendCode: string): Promise<any> {
     if (this._handshake) {
-      return await this._handshake.addFriendByCode(this.config.agentId, friendCode);
+      try {
+        return await this._handshake.addFriendByCode(this.config.agentId, friendCode);
+      } catch {
+        // Fallback to REST API
+      }
     }
 
     // Standalone: use REST API
     try {
       const apiUrl = `${this.config.serverUrl}/api/v1`;
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        ...(this._jwtToken ? { Authorization: `Bearer ${this._jwtToken}` } : {}),
+      };
+
+      // Try friend request endpoint (by account ID)
+      const frRes = await fetch(`${apiUrl}/friends/request`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ to_id: friendCode }),
+      });
+
+      if (frRes.ok || frRes.status === 201) {
+        return await frRes.json();
+      }
+
+      // Fallback: try temp-number + handshake
       const resolved = await fetch(`${apiUrl}/temp-number/${friendCode}`, {
         headers: this._jwtToken ? { Authorization: `Bearer ${this._jwtToken}` } : {},
       });
-      const data = await resolved.json() as any;
-      if (!resolved.ok) throw new Error(data.error || `HTTP ${resolved.status}`);
+      if (resolved.ok) {
+        return await fetch(`${apiUrl}/handshake/initiate`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ temp_number: friendCode }),
+        });
+      }
 
-      return await fetch(`${apiUrl}/handshake/initiate`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(this._jwtToken ? { Authorization: `Bearer ${this._jwtToken}` } : {}),
-        },
-        body: JSON.stringify({ temp_number: friendCode }),
-      });
+      throw new Error(`Could not add friend ${friendCode}: ${frRes.status}`);
     } catch (e: any) {
       throw new Error(`Add friend failed: ${e.message}`);
     }
