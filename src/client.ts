@@ -61,11 +61,12 @@ export class ZaiZeroTokenClient {
   constructor(auth?: ZaiAuthState) {
     this.auth = auth ?? loadAuth()!;
     if (!this.auth) {
-      throw new Error(
-        "Not logged in. Run `zai login` first to authenticate via browser."
-      );
+      // Cookie-based API not available — will be used as fallback only
+      // The SDK backend will be used instead
+      console.log("[ZAI] No cookie auth available, cookie-based API disabled");
+      this.auth = {} as ZaiAuthState;
     }
-    this.accessToken = this.auth.accessToken;
+    this.accessToken = this.auth.accessToken || null;
     this.deviceId = crypto.randomUUID().replace(/-/g, "");
   }
 
@@ -128,11 +129,25 @@ export class ZaiZeroTokenClient {
   }
 
   /**
-   * Build the request body for chat.z.ai assistant/stream API
+   * Build the request body for Z.AI /api/v2/chat/completions API
    */
-  private buildBody(message: string, model: string, conversationId?: string): string {
-    const assistantId = ASSISTANT_ID_MAP[model] ?? DEFAULT_ASSISTANT_ID;
+  private buildBodyV2(message: string, model: string, conversationId?: string): string {
+    return JSON.stringify({
+      model,
+      messages: [
+        { role: "user", content: message },
+      ],
+      signature_prompt: message,
+      stream: true,
+      chat_request_id: conversationId || crypto.randomUUID().replace(/-/g, ""),
+    });
+  }
 
+  /**
+   * Build request body for the old /chatglm/backend-api/assistant/stream API (deprecated)
+   */
+  private buildBodyLegacy(message: string, model: string, conversationId?: string): string {
+    const assistantId = ASSISTANT_ID_MAP[model] ?? DEFAULT_ASSISTANT_ID;
     return JSON.stringify({
       assistant_id: assistantId,
       conversation_id: conversationId || "",
@@ -150,10 +165,7 @@ export class ZaiZeroTokenClient {
         platform: "pc",
       },
       messages: [
-        {
-          role: "user",
-          content: [{ type: "text", text: message }],
-        },
+        { role: "user", content: [{ type: "text", text: message }] },
       ],
     });
   }
@@ -189,16 +201,33 @@ export class ZaiZeroTokenClient {
     }
 
     const headers = this.buildHeaders(accessToken);
-    const body = this.buildBody(prompt, model, conversationId);
 
-    console.log(`[ZAI] Sending request... model=${model} conversationId=${conversationId || "new"}`);
+    // Try v2 API first (new Open WebUI-style endpoint)
+    const bodyV2 = this.buildBodyV2(prompt, model, conversationId);
+    console.log(`[ZAI] Sending request... model=${model} conversationId=${conversationId || "new"} (v2 API)`);
 
-    const res = await fetch(`${ZAI_API_BASE}/chatglm/backend-api/assistant/stream`, {
+    let res = await fetch(`${ZAI_API_BASE}/api/v2/chat/completions`, {
       method: "POST",
-      headers,
-      body,
+      headers: {
+        ...headers,
+        "X-FE-Version": "prod-fe-1.1.45",
+        "Accept-Language": "zh-CN",
+      },
+      body: bodyV2,
       signal: options.signal,
     });
+
+    // If v2 fails with 404/405/500, fall back to legacy API
+    if (!res.ok && (res.status === 404 || res.status === 405 || res.status === 500)) {
+      console.log(`[ZAI] V2 API returned ${res.status}, trying legacy API...`);
+      const bodyLegacy = this.buildBodyLegacy(prompt, model, conversationId);
+      res = await fetch(`${ZAI_API_BASE}/chatglm/backend-api/assistant/stream`, {
+        method: "POST",
+        headers,
+        body: bodyLegacy,
+        signal: options.signal,
+      });
+    }
 
     if (!res.ok) {
       if (res.status === 401) {
@@ -207,10 +236,15 @@ export class ZaiZeroTokenClient {
         this.accessToken = null;
         const newToken = await this.ensureAccessToken();
         const retryHeaders = this.buildHeaders(newToken);
-        const retryRes = await fetch(`${ZAI_API_BASE}/chatglm/backend-api/assistant/stream`, {
+        const retryBody = this.buildBodyV2(prompt, model, conversationId);
+        const retryRes = await fetch(`${ZAI_API_BASE}/api/v2/chat/completions`, {
           method: "POST",
-          headers: retryHeaders,
-          body,
+          headers: {
+            ...retryHeaders,
+            "X-FE-Version": "prod-fe-1.1.45",
+            "Accept-Language": "zh-CN",
+          },
+          body: retryBody,
           signal: options.signal,
         });
 

@@ -276,14 +276,17 @@ export class ZaiAgentRuntime {
     this.zaiClient = new ZaiZeroTokenClient();
   }
 
+  private _pollTimer: any = null;
+  private _lastPollTimestamp: string = "";
+
   async initialize(): Promise<void> {
     if (this._initialized) return;
 
     console.log("[Agent] Initializing ZAI Agent...");
 
-    // Verify ZAI login
+    // Verify ZAI login (optional — SDK works without cookie)
     if (!isLoggedIn()) {
-      throw new Error("Not logged in to Z.AI. Run `zai login` first.");
+      console.log("[Agent] ⚠️  No Z.AI cookie login (SDK will be used as AI backend)");
     }
 
     // Initialize AICQ components
@@ -295,8 +298,14 @@ export class ZaiAgentRuntime {
     // Connect to AICQ server
     await this._connectServer();
 
+    // Sync friends from server to local DB
+    await this._syncFriendsFromServer();
+
     // Register inbound message handlers
     this._registerMessageHandlers();
+
+    // Start message polling as fallback (in case WS notifications are missed)
+    this._startMessagePolling();
 
     this._initialized = true;
     console.log("[Agent] ✅ ZAI Agent initialized successfully");
@@ -399,6 +408,128 @@ export class ZaiAgentRuntime {
       console.error(`[Agent] Failed to connect to AICQ server: ${e.message}`);
       console.log("[Agent] Will retry in background...");
     }
+  }
+
+  /**
+   * Sync friends from the AICQ server to the local database.
+   * This ensures the ChatManager and local friend list match the server state.
+   */
+  private async _syncFriendsFromServer(): Promise<void> {
+    if (!this._serverClient) return;
+
+    try {
+      const data = await this._serverClient.listFriends();
+      const serverFriends = data.friends || [];
+      console.log(`[Agent] Syncing ${serverFriends.length} friend(s) from server...`);
+
+      for (const f of serverFriends) {
+        try {
+          // Add to local DB if not already present
+          const existing = this._db.listFriends(this.config.agentId);
+          const alreadyExists = existing.some((ef: any) => ef.id === f.id);
+          if (!alreadyExists) {
+            this._db.addFriend({
+              agent_id: this.config.agentId,
+              id: f.id,
+              public_key: f.public_key || "",
+              fingerprint: "",
+              friend_type: f.type || "human",
+              ai_name: f.display_name || f.agent_name || "",
+            });
+            console.log(`[Agent] ✅ Synced friend: ${f.id} (${f.display_name || f.id})`);
+          }
+        } catch (e: any) {
+          console.error(`[Agent] Failed to sync friend ${f.id}: ${e.message}`);
+        }
+      }
+    } catch (e: any) {
+      console.error(`[Agent] Friend sync failed: ${e.message}`);
+    }
+  }
+
+  /**
+   * Start periodic message polling as a fallback.
+   * The AICQ server may only send `unread_counts` via WebSocket and
+   * not push actual message content. We also poll for recent messages
+   * to ensure nothing is missed.
+   */
+  private _startMessagePolling(): void {
+    const POLL_INTERVAL = 5000; // 5 seconds
+
+    // Track which message IDs we've already processed
+    const processedMessages = new Set<string>();
+
+    const poll = async () => {
+      if (!this._serverClient || !this._serverClient.jwtToken) return;
+
+      try {
+        const data = await this._serverClient.listFriends();
+        const friends = data.friends || [];
+
+        for (const f of friends) {
+          try {
+            const conv = await this._serverClient._request(
+              "GET",
+              `/chat/conversation/${f.id}?limit=5`,
+            );
+            const messages = conv.messages || [];
+
+            for (const msg of messages) {
+              // Skip already processed messages
+              if (processedMessages.has(msg.id)) continue;
+
+              // Skip messages from ourselves
+              const myId = this._serverClient.serverAccountId || this.config.agentId;
+              if (msg.from_id === myId || msg.fromId === myId) continue;
+
+              // Mark as processed
+              processedMessages.add(msg.id);
+
+              const content = msg.content || msg.text || "";
+              if (!content || !content.trim()) continue;
+
+              const fromId = msg.from_id || msg.fromId || f.id;
+              const msgTime = msg.created_at || msg.createdAt || "";
+              console.log(`[Agent] 📩 [poll] Message from ${fromId}: ${content.substring(0, 80)} (${msgTime})`);
+
+              // Process as incoming message
+              await this._processIncomingMessage(
+                { from: fromId, fromId, data: { content }, content, payload: content },
+                false,
+              );
+
+              // Mark as read on server
+              try {
+                await this._serverClient._request("POST", "/chat/mark-read", {
+                  friend_id: f.id,
+                });
+              } catch {
+                // Ignore mark-read errors
+              }
+            }
+          } catch (e: any) {
+            // Friend conversation fetch failed — skip
+          }
+        }
+
+        // Trim processed set if it gets too large
+        if (processedMessages.size > 1000) {
+          const arr = Array.from(processedMessages);
+          for (let i = 0; i < arr.length - 500; i++) {
+            processedMessages.delete(arr[i]);
+          }
+        }
+      } catch (e: any) {
+        console.error(`[Agent] Message poll error: ${e.message}`);
+      }
+    };
+
+    // Initial poll after a short delay
+    setTimeout(poll, 3000);
+
+    // Poll periodically
+    this._pollTimer = setInterval(poll, POLL_INTERVAL);
+    console.log(`[Agent] Message polling started (every ${POLL_INTERVAL / 1000}s)`);
   }
 
   // ─── Standalone WebSocket Connection ──────────────────────
@@ -701,15 +832,24 @@ export class ZaiAgentRuntime {
   }
 
   private async _processIncomingMessage(data: any, isGroup: boolean): Promise<void> {
-    const inner = data.data || data;
+    // Support multiple data formats:
+    // 1. WS relay: { from, fromId, data: { content }, payload }
+    // 2. Poll fetch: { from, fromId, content, payload }
+    // 3. Nested: { data: { content, from } }
+    const inner = (typeof data.data === "object" && data.data !== null) ? data.data : {};
     const fromId = inner.from || inner.fromId || data.from || data.fromId;
     const groupId = inner.groupId || data.groupId;
-    const content = inner.content || inner.payload || inner.text || data.content || data.payload || "";
+    const content = inner.content || inner.payload || inner.text
+      || data.content || data.payload || data.text || "";
 
-    if (!fromId) return;
+    if (!fromId) {
+      console.log("[Agent] ⚠️ Message without fromId, skipping:", JSON.stringify(data).substring(0, 200));
+      return;
+    }
 
-    // Skip own messages
-    if (fromId === this._serverAccountId || fromId === this.config.agentId) return;
+    // Also check _serverClient for server account ID
+    const myAccountId = this._serverAccountId || this._serverClient?.serverAccountId || "";
+    if (fromId === myAccountId || fromId === this.config.agentId) return;
 
     const chatId = isGroup ? groupId : fromId;
     const displayFrom = isGroup ? `群组 ${groupId}` : fromId;
@@ -855,27 +995,35 @@ export class ZaiAgentRuntime {
       }
     }
 
-    let fullReply = "";
+    console.log(`[Agent] 🤖 Generating reply for: "${userMessage.substring(0, 60)}"...`);
 
+    // Strategy: Try z-ai-web-dev-sdk FIRST (it works from server environments),
+    // then fall back to cookie-based web API (may be blocked by CDN).
+    try {
+      console.log("[Agent] Using z-ai-web-dev-sdk as primary AI backend...");
+      const reply = await this._chatViaSDK(userMessage, history);
+      this.memory.add(chatId, "assistant", reply);
+      console.log(`[Agent] ✅ SDK reply generated (${reply.length} chars): "${reply.substring(0, 60)}..."`);
+      await this._sendReply(chatId, reply, isGroup);
+      return;
+    } catch (sdkErr: any) {
+      console.error(`[Agent] ⚠️ SDK failed: ${sdkErr.message}`);
+    }
+
+    // Fallback: try cookie-based web API (streaming)
+    let fullReply = "";
     const streamCallbacks: StreamCallbacks = {
       onText: (delta) => {
         fullReply += delta;
       },
       onThinking: (delta) => {
-        // We don't stream thinking to users, but we could
-        // console.log(`[Agent] [think] ${delta.substring(0, 50)}`);
+        // Ignore thinking output
       },
       onDone: async (fullText) => {
-        // Add to memory
         this.memory.add(chatId, "assistant", fullText);
-
-        // Send the complete reply via AICQ
-        // For short replies, send as single message
-        // For longer replies, use stream_chunk protocol
         if (fullText.length <= this.config.streamChunkSize * 3) {
           await this._sendReply(chatId, fullText, isGroup);
         } else {
-          // Stream the reply in chunks via AICQ protocol
           await this._streamReplyChunks(chatId, fullText, isGroup);
         }
       },
@@ -891,8 +1039,8 @@ export class ZaiAgentRuntime {
         history,
       });
     } catch (e: any) {
-      // If streaming fails, try non-streaming
-      console.log("[Agent] Stream failed, trying non-streaming...");
+      console.error(`[Agent] ⚠️ Cookie streaming failed: ${e.message}`);
+      // Last resort: try non-streaming cookie API
       try {
         const result = await this.zaiClient.chat(userMessage, {
           model: this.config.model,
@@ -902,15 +1050,8 @@ export class ZaiAgentRuntime {
         this.memory.add(chatId, "assistant", result.text);
         await this._sendReply(chatId, result.text, isGroup);
       } catch (e2: any) {
-        // Web API failed — try z-ai-web-dev-sdk as fallback (uses internal API)
-        console.log("[Agent] Web API failed, trying internal SDK...");
-        try {
-          const reply = await this._chatViaSDK(userMessage, history);
-          this.memory.add(chatId, "assistant", reply);
-          await this._sendReply(chatId, reply, isGroup);
-        } catch (e3: any) {
-          throw new Error(`Chat failed: ${e2.message} / SDK: ${e3.message}`);
-        }
+        console.error(`[Agent] ❌ All AI backends failed. SDK+Cookie API both unavailable.`);
+        throw new Error(`All AI backends failed: ${e2.message}`);
       }
     }
   }
@@ -994,18 +1135,20 @@ export class ZaiAgentRuntime {
   // ─── Send Reply ────────────────────────────────────────────
 
   private async _sendReply(chatId: string, text: string, isGroup: boolean): Promise<void> {
+    console.log(`[Agent] 📤 Sending reply to ${chatId} (${text.length} chars)...`);
+
+    // Method 1: Use the full AICQ chat manager (handles encryption, session keys)
     if (this._chat) {
-      // Use the full AICQ chat manager
       try {
         await this._chat.sendMessage(this.config.agentId, chatId, text, { isGroup });
-        console.log(`[Agent] 📤 Reply sent to ${chatId}: ${text.substring(0, 50)}...`);
+        console.log(`[Agent] ✅ Reply sent via ChatManager to ${chatId}`);
         return;
       } catch (e: any) {
-        console.error("[Agent] Chat send failed:", e.message);
+        console.error("[Agent] ⚠️ ChatManager send failed:", e.message);
       }
     }
 
-    // Fallback: direct WebSocket relay
+    // Method 2: Direct WebSocket relay
     if (isGroup) {
       const sent = this._sendWS({
         type: "group_message",
@@ -1016,7 +1159,8 @@ export class ZaiAgentRuntime {
         timestamp: Date.now(),
       });
       if (sent) {
-        console.log(`[Agent] 📤 Group reply sent to ${chatId}`);
+        console.log(`[Agent] ✅ Group reply sent via WS to ${chatId}`);
+        return;
       }
     } else {
       const sent = this._sendWS({
@@ -1025,24 +1169,44 @@ export class ZaiAgentRuntime {
         payload: text,
       });
       if (sent) {
-        console.log(`[Agent] 📤 DM reply sent to ${chatId}`);
-      } else {
-        // Try REST API fallback
-        try {
-          const apiUrl = `${this.config.serverUrl}/api/v1`;
-          await fetch(`${apiUrl}/messages/send`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              ...(this._jwtToken ? { Authorization: `Bearer ${this._jwtToken}` } : {}),
-            },
-            body: JSON.stringify({ targetId: chatId, payload: text }),
-          });
-          console.log(`[Agent] 📤 Reply sent via REST to ${chatId}`);
-        } catch (e: any) {
-          console.error("[Agent] REST fallback also failed:", e.message);
-        }
+        console.log(`[Agent] ✅ DM reply sent via WS relay to ${chatId}`);
+        return;
       }
+    }
+
+    // Method 3: Use ServerClient's REST API (most reliable fallback)
+    if (this._serverClient && this._serverClient.jwtToken) {
+      try {
+        await this._serverClient._request("POST", "/messages/send", {
+          targetId: chatId,
+          payload: text,
+        });
+        console.log(`[Agent] ✅ Reply sent via REST API to ${chatId}`);
+        return;
+      } catch (e: any) {
+        console.error("[Agent] ⚠️ REST API send failed:", e.message);
+      }
+    }
+
+    // Method 4: Direct REST call as last resort
+    try {
+      const apiUrl = `${this.config.serverUrl}/api/v1`;
+      const jwt = this._serverClient?.jwtToken || this._jwtToken;
+      const res = await fetch(`${apiUrl}/messages/send`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(jwt ? { Authorization: `Bearer ${jwt}` } : {}),
+        },
+        body: JSON.stringify({ targetId: chatId, payload: text }),
+      });
+      if (res.ok) {
+        console.log(`[Agent] ✅ Reply sent via direct REST to ${chatId}`);
+      } else {
+        console.error(`[Agent] ❌ Direct REST failed: ${res.status}`);
+      }
+    } catch (e: any) {
+      console.error("[Agent] ❌ All send methods failed:", e.message);
     }
   }
 
