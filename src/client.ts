@@ -22,6 +22,24 @@ import {
   type ZaiAuthState,
 } from "./auth.js";
 
+// ─── Proxy Configuration ──────────────────────────────────────
+// When ZAI_PROXY_URL is set (e.g., http://aicq.online:9876),
+// all API requests are routed through this proxy to bypass CDN blocking.
+// The proxy runs on a remote Windows server that has access to chat.z.ai.
+
+const ZAI_PROXY_URL = process.env.ZAI_PROXY_URL || "";
+
+function getApiBase(): string {
+  if (ZAI_PROXY_URL) {
+    return ZAI_PROXY_URL.replace(/\/+$/, "");
+  }
+  return ZAI_API_BASE;
+}
+
+if (ZAI_PROXY_URL) {
+  console.log(`[ZAI] Using proxy: ${ZAI_PROXY_URL} → ${ZAI_API_BASE}`);
+}
+
 // ─── Types ────────────────────────────────────────────────────
 
 export interface ChatMessage {
@@ -206,7 +224,7 @@ export class ZaiZeroTokenClient {
     const bodyV2 = this.buildBodyV2(prompt, model, conversationId);
     console.log(`[ZAI] Sending request... model=${model} conversationId=${conversationId || "new"} (v2 API)`);
 
-    let res = await fetch(`${ZAI_API_BASE}/api/v2/chat/completions`, {
+    let res = await fetch(`${getApiBase()}/api/v2/chat/completions`, {
       method: "POST",
       headers: {
         ...headers,
@@ -221,7 +239,7 @@ export class ZaiZeroTokenClient {
     if (!res.ok && (res.status === 404 || res.status === 405 || res.status === 500)) {
       console.log(`[ZAI] V2 API returned ${res.status}, trying legacy API...`);
       const bodyLegacy = this.buildBodyLegacy(prompt, model, conversationId);
-      res = await fetch(`${ZAI_API_BASE}/chatglm/backend-api/assistant/stream`, {
+      res = await fetch(`${getApiBase()}/chatglm/backend-api/assistant/stream`, {
         method: "POST",
         headers,
         body: bodyLegacy,
@@ -237,7 +255,7 @@ export class ZaiZeroTokenClient {
         const newToken = await this.ensureAccessToken();
         const retryHeaders = this.buildHeaders(newToken);
         const retryBody = this.buildBodyV2(prompt, model, conversationId);
-        const retryRes = await fetch(`${ZAI_API_BASE}/api/v2/chat/completions`, {
+        const retryRes = await fetch(`${getApiBase()}/api/v2/chat/completions`, {
           method: "POST",
           headers: {
             ...retryHeaders,

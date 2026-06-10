@@ -997,20 +997,11 @@ export class ZaiAgentRuntime {
 
     console.log(`[Agent] 🤖 Generating reply for: "${userMessage.substring(0, 60)}"...`);
 
-    // Strategy: Try z-ai-web-dev-sdk FIRST (it works from server environments),
-    // then fall back to cookie-based web API (may be blocked by CDN).
-    try {
-      console.log("[Agent] Using z-ai-web-dev-sdk as primary AI backend...");
-      const reply = await this._chatViaSDK(userMessage, history);
-      this.memory.add(chatId, "assistant", reply);
-      console.log(`[Agent] ✅ SDK reply generated (${reply.length} chars): "${reply.substring(0, 60)}..."`);
-      await this._sendReply(chatId, reply, isGroup);
-      return;
-    } catch (sdkErr: any) {
-      console.error(`[Agent] ⚠️ SDK failed: ${sdkErr.message}`);
-    }
+    // Strategy: Try cookie-based web API FIRST (with proxy if ZAI_PROXY_URL is set),
+    // then fall back to z-ai-web-dev-sdk (which always works from server environments).
+    // Cookie API is preferred because it uses the user's own account and model access.
 
-    // Fallback: try cookie-based web API (streaming)
+    // Try cookie-based web API (streaming)
     let fullReply = "";
     const streamCallbacks: StreamCallbacks = {
       onText: (delta) => {
@@ -1040,8 +1031,9 @@ export class ZaiAgentRuntime {
       });
     } catch (e: any) {
       console.error(`[Agent] ⚠️ Cookie streaming failed: ${e.message}`);
-      // Last resort: try non-streaming cookie API
+      // Fallback 1: try non-streaming cookie API
       try {
+        console.log("[Agent] Trying non-streaming cookie API...");
         const result = await this.zaiClient.chat(userMessage, {
           model: this.config.model,
           systemPrompt: this.config.systemPrompt,
@@ -1049,9 +1041,22 @@ export class ZaiAgentRuntime {
         });
         this.memory.add(chatId, "assistant", result.text);
         await this._sendReply(chatId, result.text, isGroup);
+        return;
       } catch (e2: any) {
-        console.error(`[Agent] ❌ All AI backends failed. SDK+Cookie API both unavailable.`);
-        throw new Error(`All AI backends failed: ${e2.message}`);
+        console.error(`[Agent] ⚠️ Non-streaming cookie API also failed: ${e2.message}`);
+      }
+
+      // Fallback 2: try z-ai-web-dev-sdk (always works from server environments)
+      try {
+        console.log("[Agent] Falling back to z-ai-web-dev-sdk...");
+        const reply = await this._chatViaSDK(userMessage, history);
+        this.memory.add(chatId, "assistant", reply);
+        console.log(`[Agent] ✅ SDK reply generated (${reply.length} chars): "${reply.substring(0, 60)}..."`);
+        await this._sendReply(chatId, reply, isGroup);
+        return;
+      } catch (sdkErr: any) {
+        console.error(`[Agent] ❌ All AI backends failed. Cookie API + SDK both unavailable.`);
+        throw new Error(`All AI backends failed: ${sdkErr.message}`);
       }
     }
   }
